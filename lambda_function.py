@@ -836,9 +836,8 @@ def send_error_email(ssm, file_name, error_list, email_msg):
     PORT = 587
 
     try:
-        #RECIPIENT_RAW = ssm.get_parameter(Name="Shipping_Manifest_Recipents", WithDecryption=True).get("Parameter").get("Value")
-        #RECIPIENT = RECIPIENT_RAW.replace(" ", "")
-        RECIPIENT_LIST = ["wangfuyuan2020@outlook.com"]
+        RECIPIENT_RAW = ssm.get_parameter(Name="Shipping_Manifest_Recipents", WithDecryption=True).get("Parameter").get("Value")
+        RECIPIENT = RECIPIENT_RAW.replace(" ", "")
         SUBJECT = f'Data Submission Feedback: {file_name}'
         SENDERNAME = 'SeroNet Data Team (Data Curation)'
         SENDER = ssm.get_parameter(Name="sender-email", WithDecryption=True).get("Parameter").get("Value")
