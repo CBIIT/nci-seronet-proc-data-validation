@@ -46,13 +46,13 @@ def lambda_handler(event, context):
     curr_cbc = file_path.split("/")[1] #should be 1 if the path is under need_to_validate function
     sub_name = file_path.split("/")[3][15:]
     site_name = cbc_name_list[curr_cbc][0]
-    error_message = Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm)
-    slack_fail = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
     passed_bucket = ssm.get_parameter(Name="data_validation_passed_bucket", WithDecryption=True).get("Parameter").get("Value")
     fail_bucket = ssm.get_parameter(Name="data_validation_failed_bucket", WithDecryption=True).get("Parameter").get("Value")
     slack_pass = ssm.get_parameter(Name="success_hook_url", WithDecryption=True).get("Parameter").get("Value")
     USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
     PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
+    error_message = Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm, passed_bucket)
+    slack_fail = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
     if len(error_message['message']) > 0:
         message_slack_fail = "Your data submission " + sub_name +" has been analyzed by the validation software.\n"
         if error_message["message_type"] == "data_validation_error":
@@ -64,7 +64,7 @@ def lambda_handler(event, context):
         else:
             for m in error_message['message']:
                 message_slack_fail = message_slack_fail + m + "\n"
-        #write_to_slack(message_slack_fail, slack_fail)
+        write_to_slack(message_slack_fail, slack_fail)
         move_submission(bucket, fail_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
         send_error_email(ssm, sub_name, list(error_message['message']), message_slack_fail)
     else:
@@ -76,7 +76,7 @@ def lambda_handler(event, context):
 
 
 
-def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm):
+def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm, passed_bucket):
     error_message = {"message_type": '', "message": []}
     if len(template_df) == 0:
         print("Study Name was not found, please correct")
@@ -109,7 +109,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
 #    if check_BSI_tables is True:
 #        check_bio_repo_tables(s3_client, s3_resource, study_type)  # Create BSI report using file in S3 bucket
 ###############################################################################################
-    cbc_bucket = "seronet-trigger-submissions-passed" #some files are in the pass bucket
+    cbc_bucket = passed_bucket #some files are in the pass bucket
     if study_type == "Refrence_Pannel":
         # sql_table_dict = db_loader_ref_pannels.Db_loader_main(sql_tuple, validation_date)
 
@@ -143,6 +143,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
         print(bucket)
         resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=file_folder_key)
         file_list = resp['Contents']
+        print(resp)
 #############################################################################################
         if len(file_list) == 0:
             print("\nThe Files_To_Validate Folder is empty, no Submissions Downloaded to Process\n")
@@ -838,11 +839,13 @@ def send_error_email(ssm, file_name, error_list, email_msg):
     try:
         RECIPIENT_RAW = ssm.get_parameter(Name="Shipping_Manifest_Recipents", WithDecryption=True).get("Parameter").get("Value")
         RECIPIENT = RECIPIENT_RAW.replace(" ", "")
+        RECIPIENT_LIST = RECIPIENT.split(",")
         SUBJECT = f'Data Submission Feedback: {file_name}'
         SENDERNAME = 'SeroNet Data Team (Data Curation)'
         SENDER = ssm.get_parameter(Name="sender-email", WithDecryption=True).get("Parameter").get("Value")
 
         for recipient in RECIPIENT_LIST:
+            print(recipient)
             msg_text = ""
             msg_text += "Your accrual submission has been analyzed by the validation software. \n"
             msg_text += email_msg
@@ -875,5 +878,5 @@ def send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient,
     server.login(USERNAME_SMTP, PASSWORD_SMTP)
 
     server.sendmail(SENDER, recipient, msg.as_string())
-    print(msg)
+    #print(msg)
     server.close()
