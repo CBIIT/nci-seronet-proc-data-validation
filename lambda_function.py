@@ -807,7 +807,7 @@ def to_s3_csv(file_key, df, index_bool, bucket, s3_client):
 def write_to_slack(message_slack, slack_chanel):
     http = urllib3.PoolManager()
     data={"text": message_slack}
-    r=http.request("POST", slack_chanel, body=json.dumps(data), headers={"Content-Type":"application/json"}, verify = False)
+    r=http.request("POST", slack_chanel, body=json.dumps(data), headers={"Content-Type":"application/json"})
 
 def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type):
     # curr_bucket = seronet-demo-cbc-destination
