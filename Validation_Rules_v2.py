@@ -33,6 +33,7 @@ def check_serology_shipping(pd, s3_client, bucket, sql_tuple):
 
 def Validation_Rules(re, datetime, current_object, data_table, file_name, valid_cbc_ids, drop_list, study_type):
     col_list = current_object.Data_Object_Table[file_name]["Column_List"]
+    #print(current_object.Data_Object_Table[file_name])
     if len(col_list) > 0:
         data_table.drop_duplicates(col_list, inplace=True)
     data_table.reset_index(inplace=True)
@@ -233,6 +234,9 @@ def check_ID_validation(header_name, current_object, file_name, data_table, re, 
         if file_name not in ["Validation_Panel.xlsx"]:
             pattern_str = '[_]{1}[0-9]{3}$'
             current_object.check_id_field(file_name, data_table, re, header_name, pattern_str, valid_cbc_ids, "XX_XXX")
+            #print("validation_rule")
+            #print(file_name)
+            #print(current_object.Data_Object_Table["assay.csv"]["Data_Table"])
             current_object.check_assay_special(data_table, header_name, "assay.csv", file_name, re)
         if file_name in ["assay.csv"]:
             current_object.check_for_dup_ids(file_name, header_name)
@@ -418,7 +422,7 @@ def check_base_line_demo(header_name, current_object, data_table, file_name, dat
     if Rule_Found is True:
         pass
     elif "Visit_Date_Duration_From_Index" in header_name:
-        current_object.check_if_number(file_name, data_table, header_name, 'None', "None", ["Unknown"], -1e9, 1e9, "int")
+        current_object.check_if_number(file_name, data_table, header_name, 'None', "None", ["Unknown"], -500, 1000, "float")
     elif header_name in ["Weight"]:
         current_object.check_if_number(file_name, data_table, header_name, 'None', "None",
                                        ["Not Reported", "N/A"], 1, 1000, "float")  # heaviest weight 1000 lbs (can adjust)
@@ -674,7 +678,7 @@ def check_confimation_rules(header_name, current_object, data_table, file_name, 
         Required_column = "Yes"
         current_object.check_if_number(file_name, data_table, header_name, "None", "None", ["N/A"], 0, 5000, "float")
     elif (header_name in ["Assay_Replicate", "Sample_Dilution"]):
-        current_object.check_if_number(file_name, data_table, header_name, "None", "None", [], 0, 200, "float")
+        current_object.check_if_number(file_name, data_table, header_name, "None", "None", [], 0, 25000, "float")
     elif (header_name in ["Raw_Result", "Positive_Control_Reading", "Negative_Control_Reading"]):
         current_object.check_if_number(file_name, data_table, header_name, "None", "None", ["N/A"], 0, 1e9, "float")
     elif header_name in ["Sample_Type"]:
@@ -689,7 +693,7 @@ def check_confimation_rules(header_name, current_object, data_table, file_name, 
         current_object.check_in_list(file_name, data_table, header_name, "Raw_Result", ["N/A"], ["N/A"])
     elif ("Biospecimen_Collection_to_Test_Duration" in header_name):
         Required_column = "Yes"
-        current_object.check_if_number(file_name, data_table, header_name, "None", "None", [], -1000, 1000, "float")
+        current_object.check_if_number(file_name, data_table, header_name, "None", "None", [], -1000, 4000, "float")
     else:
         return Required_column, False
     return Required_column, True
@@ -839,6 +843,9 @@ def check_shipping(current_object, pd, conn):
         compare_tables = shipping_table.merge(aliquot_table, left_on=["Current Label"], right_on=["Aliquot_ID"], indicator=True, how="outer")
 
         match_ids = compare_tables.query("_merge  in ['both']")
+        match_ids["Volume"] = [round(i,2) for i in match_ids["Volume"]] 
+        match_ids["Aliquot_Volume"] = [round(i,2) for i in match_ids["Aliquot_Volume"]]
+
         z = match_ids.query("Volume !=  Aliquot_Volume")
 
         compare_tables = compare_tables.query("_merge in ['left_only']")
@@ -1049,7 +1056,7 @@ def check_comorbid_hist(pd, sql_tuple, curr_obj):
 
     if "Diabetes" not in base_table.columns:
         return
-
+    
     visit_table = pd.concat([base_table, followup_table])
     visit_table = visit_table.sort_values(["Research_Participant_ID", "Visit_Number"], ascending=(True, True))
     uni_part = list(set(visit_table["Research_Participant_ID"].tolist()))
@@ -1106,6 +1113,7 @@ def check_vacc_hist(pd, sql_tuple, curr_obj):
     all_list['Research_Participant_ID'] = [i[:9] for i in all_list["Visit_Info_ID"]]
     try:
         filt_visit = curr_obj.All_Part_ids.merge(all_list)
+        #print(filt_visit)
     except Exception as e:
         print(e)
 

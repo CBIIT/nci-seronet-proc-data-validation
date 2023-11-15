@@ -551,7 +551,7 @@ class Submission_Object:
         self.update_keys(pd, 'Research_Participant_ID', part_str, connection_tuple)
         self.update_keys(pd, 'Biospecimen_ID', bio_str, connection_tuple)
         self.update_keys(pd, 'Aliquot_ID', aliquot_str, connection_tuple)
-        for z in self.Data_Object_Table:
+        for z in self.Data_Object_Table.keys():
             try:
                 self.Data_Object_Table[z]["Data_Table"].drop_duplicates(inplace=True)
             except Exception as e:
@@ -1125,9 +1125,8 @@ class Submission_Object:
         all_merge.drop_duplicates(inplace=True)
         all_merge.replace({"both": "Found", "left_only": "Missing"}, inplace=True)
 
-        self.check_validation_folder()
-        #all_merge.to_csv(self.Data_Validation_Path + file_sep + error_table, index=False)
-        self.to_s3_csv(all_merge, self.Data_Validation_Path + file_sep + error_table, False)
+        self.check_validation_folder(os)
+        all_merge.to_csv(self.Data_Validation_Path + file_sep + error_table, index=False)
 
     def compare_assay_data(self, sheet_1, sheet_2, key_list, error_msg):
         if ((sheet_1 in self.Data_Object_Table) and (sheet_2 in self.Data_Object_Table)):
@@ -1163,7 +1162,7 @@ class Submission_Object:
             miss_terms = self.find_missing_terms(follow_table, norm_table, error_table, "follow_up.csv")
         if len(miss_terms) > 0:
             miss_terms.drop_duplicates(inplace=True)
-            print(miss_terms)
+            #print(miss_terms)
 
     def find_missing_terms(self, df, norm_table, error_table, table_name):
         uni_cond = list(set(norm_table["Comorbid_Name"]))

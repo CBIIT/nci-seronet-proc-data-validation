@@ -52,8 +52,13 @@ def lambda_handler(event, context):
     USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
     PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
     error_message = Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm, passed_bucket)
+    print(error_message)
     slack_fail = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
-    if len(error_message['message']) > 0:
+    warning_message = []
+    for msg in error_message['message']:
+        if "Cross_Sheet_Comobidity.csv" in msg or "Missing_Visit_Info" in msg:
+            warning_message.append(msg)
+    if len(error_message['message']) - len(warning_message) > 1:
         message_slack_fail = "Your data submission " + sub_name +" has been analyzed by the validation software.\n"
         if error_message["message_type"] == "data_validation_error":
             for i in range(0, len(error_message['message'])):
@@ -66,13 +71,15 @@ def lambda_handler(event, context):
                 message_slack_fail = message_slack_fail + m + "\n"
         write_to_slack(message_slack_fail, slack_fail)
         move_submission(bucket, fail_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
-        send_error_email(ssm, sub_name, list(error_message['message']), message_slack_fail)
+        send_respond_email(ssm, sub_name, list(error_message['message']), message_slack_fail)
     else:
-        message_slack_success = "Your data submission " + sub_name + " has been analyzed by the validation software.\n"
-        + "1) Analysis of the Zip File: Passed\n"
-        + "2) Data Validation: Passed\n"
+        message_slack_success = "Your data submission " + sub_name + " has been analyzed by the validation software.\n" + "1) Analysis of the Zip File: Passed\n" + "2) Data Validation: Passed\n"
+        if len(warning_message) > 0:
+            for i in range(0, len(warning_message)):
+                message_slack_success = message_slack_success + str(i + 3) + ") " + "Warning: " + warning_message[i] + "\n"
         write_to_slack(message_slack_success, slack_pass)
         move_submission(bucket, passed_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
+        send_respond_email(ssm, sub_name, warning_message, message_slack_success)
 
 
 
@@ -124,6 +131,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
         start_time = time.time()
         #assay_data, assay_target, all_qc_data, converion_file = get_box_data_v2.get_assay_data("CBC_Data")
         assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", cbc_bucket)
+        #assay_data = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
         study_design = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
         study_design.drop("Cohort_Index", axis=1, inplace=True)
         #get_box_data_v2.get_study_design()
@@ -143,7 +151,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
         print(bucket)
         resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=file_folder_key)
         file_list = resp['Contents']
-        print(resp)
+        #print(resp)
 #############################################################################################
         if len(file_list) == 0:
             print("\nThe Files_To_Validate Folder is empty, no Submissions Downloaded to Process\n")
@@ -201,7 +209,6 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
                 current_sub_object.populate_missing_keys(sql_tuple)
                 data_table = current_sub_object.Data_Object_Table
                 empty_list = []
-
                 for file_name in data_table:
                     current_sub_object.set_key_cols(file_name, study_type)
                     if len(data_table[file_name]["Data_Table"]) == 0 and "visit_info_sql.csv" not in file_name:
@@ -218,7 +225,6 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
             except Exception as e:
                 display_error_line(e)
                 print("Submission does not match study type, visit info is missing")
-
             current_sub_object.update_object(assay_data, "assay.csv")
             current_sub_object.update_object(assay_target, "assay_target.csv")
             current_sub_object.update_object(study_design, "study_design.csv")
@@ -244,6 +250,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
                     if file_name in ignore_validation_list or "_sql.csv" in file_name:
                         continue
                     if "Data_Table" in current_sub_object.Data_Object_Table[file_name]:
+                        print(file_name)
                         data_table, drop_list = current_sub_object.merge_tables(file_name)
                         current_sub_object.Data_Object_Table[file_name]['Data_Table'] = data_table.drop(drop_list, axis=1)
                         current_sub_object.Data_Object_Table[file_name]['Data_Table'].drop_duplicates(inplace=True)
@@ -303,7 +310,6 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
                 print("An Error Occured when trying to write output file")
                 display_error_line(err)
     except Exception as e:
-        print(e)
         display_error_line(e)
     finally:
         '''
@@ -801,7 +807,7 @@ def to_s3_csv(file_key, df, index_bool, bucket, s3_client):
 def write_to_slack(message_slack, slack_chanel):
     http = urllib3.PoolManager()
     data={"text": message_slack}
-    r=http.request("POST", slack_chanel, body=json.dumps(data), headers={"Content-Type":"application/json"})
+    r=http.request("POST", slack_chanel, body=json.dumps(data), headers={"Content-Type":"application/json"}, verify = False)
 
 def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type):
     # curr_bucket = seronet-demo-cbc-destination
@@ -829,7 +835,7 @@ def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, 
             print('Error Message: {}'.format(error))
 
 
-def send_error_email(ssm, file_name, error_list, email_msg):
+def send_respond_email(ssm, file_name, error_list, email_msg):
     http = urllib3.PoolManager()
     USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
     PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
@@ -847,7 +853,7 @@ def send_error_email(ssm, file_name, error_list, email_msg):
         for recipient in RECIPIENT_LIST:
             print(recipient)
             msg_text = ""
-            msg_text += "Your accrual submission has been analyzed by the validation software. \n"
+            msg_text += "Your data submission has been analyzed by the validation software. \n"
             msg_text += email_msg
 
             msg = MIMEMultipart('alternative')
@@ -860,7 +866,7 @@ def send_error_email(ssm, file_name, error_list, email_msg):
             msg['To'] = recipient
             part1 = MIMEText(msg_text, "plain")
             msg.attach(part1)
-
+            print(msg_text)
             send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg)
             print("email has been sent")
 
