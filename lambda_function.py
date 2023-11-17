@@ -821,8 +821,11 @@ def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, 
     "Reference Panel Submissions/"
     all_files = s3_client.list_objects_v2(Bucket=curr_bucket, Prefix=os.path.dirname(os.path.split(file_path)[0]))["Contents"]
     all_files = [i["Key"] for i in all_files]
+    sub_files = [i["Key"] for i in all_files if "UnZipped_Files/submission.csv" not in i["Key"]]
+    submission_csv_key = [i["Key"] for i in all_files if "UnZipped_Files/submission.csv" in i["Key"]]
+    sub_files.append(submission_csv_key[0])
 
-    for curr_key in all_files:
+    for curr_key in sub_files:
         new_key = curr_key.replace("Data_Submissions_Need_To_Validate", site_name)
         new_key = new_key.replace(curr_cbc+'/', '')
         new_key = study_sub_folder + new_key
