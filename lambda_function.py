@@ -131,8 +131,6 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
         start_time = time.time()
         #assay_data, assay_target, all_qc_data, converion_file = get_box_data_v2.get_assay_data("CBC_Data")
         assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", bucket)
-        print(assay_data.keys())
-        print(assay_target.keys())
         #assay_data = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
         study_design = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
         study_design.drop("Cohort_Index", axis=1, inplace=True)
