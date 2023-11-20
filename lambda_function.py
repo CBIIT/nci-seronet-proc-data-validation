@@ -130,7 +130,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
 # pulls the all assay data directly from box
         start_time = time.time()
         #assay_data, assay_target, all_qc_data, converion_file = get_box_data_v2.get_assay_data("CBC_Data")
-        assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", cbc_bucket)
+        assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", bucket)
         #assay_data = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
         study_design = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
         study_design.drop("Cohort_Index", axis=1, inplace=True)
@@ -818,11 +818,10 @@ def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, 
         study_sub_folder = "Vaccine Response Submissions/"
     else:
         study_sub_folder = "Reference Panel Submissions/"
-    "Reference Panel Submissions/"
     all_files = s3_client.list_objects_v2(Bucket=curr_bucket, Prefix=os.path.dirname(os.path.split(file_path)[0]))["Contents"]
     all_files = [i["Key"] for i in all_files]
-    sub_files = [i["Key"] for i in all_files if "UnZipped_Files/submission.csv" not in i["Key"]]
-    submission_csv_key = [i["Key"] for i in all_files if "UnZipped_Files/submission.csv" in i["Key"]]
+    sub_files = [i for i in all_files if "UnZipped_Files/submission.csv" not in i]
+    submission_csv_key = [i for i in all_files if "UnZipped_Files/submission.csv" in i]
     sub_files.append(submission_csv_key[0])
 
     for curr_key in sub_files:
@@ -833,7 +832,7 @@ def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, 
         try:
             s3_resource.meta.client.copy(source, new_bucket, new_key)
             print(f"atempting to delete {curr_bucket} / {curr_key}")
-            #s3_client.delete_object(Bucket=curr_bucket, Key=curr_key)
+            s3_client.delete_object(Bucket=curr_bucket, Key=curr_key)
         except Exception as error:
             print('Error Message: {}'.format(error))
 
