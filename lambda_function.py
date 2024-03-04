@@ -17,6 +17,7 @@ from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 import email.utils
 import smtplib
+import zipfile
 #from get_data_to_check_v2 import get_summary_file
 #import db_loader_ref_pannels
 # import db_loader_vac_resp
@@ -52,8 +53,17 @@ def lambda_handler(event, context):
     USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
     PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
     error_message = Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm, passed_bucket)
-    print(error_message)
     slack_fail = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
+    
+    data_validation_prefix = os.path.dirname(file_path).replace("File_Validation_Results", "Data_Validation_Results")
+    temp_dir = '/tmp/'
+    zip_file_name = [i for i in data_validation_prefix.split(os.sep) if ".zip" in i][0].replace(".zip", "_data_validation_result.zip")
+    s3_file_key = ""
+    data_validation_response = s3_client.list_objects_v2(Bucket=bucket, Prefix=data_validation_prefix)
+    # Download and zip files from S3
+    if "Contents" in data_validation_response.keys():
+        s3_file_key = zip_files_from_s3(s3_client, data_validation_response, bucket, data_validation_prefix, temp_dir, zip_file_name)
+
     warning_message = []
     for msg in error_message['message']:
         if "Cross_Sheet_Comobidity.csv" in msg or "Missing_Visit_Info" in msg:
@@ -71,7 +81,7 @@ def lambda_handler(event, context):
                 message_slack_fail = message_slack_fail + m + "\n"
         write_to_slack(message_slack_fail, slack_fail)
         move_submission(bucket, fail_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
-        send_respond_email(ssm, sub_name, list(error_message['message']), message_slack_fail)
+        send_respond_email(s3_client, bucket, ssm, sub_name, list(error_message['message']), message_slack_fail, s3_file_key)
     else:
         message_slack_success = "Your data submission " + sub_name + " has been analyzed by the validation software.\n" + "1) Analysis of the Zip File: Passed\n" + "2) Data Validation: Passed\n"
         if len(warning_message) > 0:
@@ -79,7 +89,7 @@ def lambda_handler(event, context):
                 message_slack_success = message_slack_success + str(i + 3) + ") " + "Warning: " + warning_message[i] + "\n"
         write_to_slack(message_slack_success, slack_pass)
         move_submission(bucket, passed_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
-        send_respond_email(ssm, sub_name, warning_message, message_slack_success)
+        send_respond_email(s3_client, bucket, ssm, sub_name, warning_message, message_slack_success, s3_file_key)
 
 
 
@@ -130,9 +140,9 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
 # pulls the all assay data directly from box
         start_time = time.time()
         #assay_data, assay_target, all_qc_data, converion_file = get_box_data_v2.get_assay_data("CBC_Data")
-        assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", bucket)
+        assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", cbc_bucket)
         #assay_data = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
-        study_design = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
+        study_design = pd.read_sql(sd.text("Select * from Study_Design"), sql_tuple[2])
         study_design.drop("Cohort_Index", axis=1, inplace=True)
         #get_box_data_v2.get_study_design()
 
@@ -196,6 +206,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
                     return error_message
                 col_error_message = ''
                 col_err_count, col_error_message = current_sub_object.check_col_errors(file_folder_key)
+
                 if col_err_count > 0:
                     print("Submission has Column Errors, Data Validation NOT Preformed")
                     error_message['message_type'] = "submission_validation_error"
@@ -209,6 +220,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
                 current_sub_object.populate_missing_keys(sql_tuple)
                 data_table = current_sub_object.Data_Object_Table
                 empty_list = []
+
                 for file_name in data_table:
                     current_sub_object.set_key_cols(file_name, study_type)
                     if len(data_table[file_name]["Data_Table"]) == 0 and "visit_info_sql.csv" not in file_name:
@@ -225,6 +237,7 @@ def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource
             except Exception as e:
                 display_error_line(e)
                 print("Submission does not match study type, visit info is missing")
+
             current_sub_object.update_object(assay_data, "assay.csv")
             current_sub_object.update_object(assay_target, "assay_target.csv")
             current_sub_object.update_object(study_design, "study_design.csv")
@@ -378,7 +391,7 @@ def check_result_message(result_key, file_list, passing_msg, bucket, s3_client):
                 result_file = s3_client.get_object(Bucket=bucket, Key=result_key)
                 result_message = result_file['Body'].read().decode('utf-8')
             except Exception as e:
-                print(e)
+                display_error_line(e)
                 return result_message
             if result_message != passing_msg:
                 print("Submitted File FAILED the File-Validation Process. With Error Message: " + result_message + "\n")
@@ -421,7 +434,7 @@ def zero_pad_ids(curr_obj):
             z = [i[0:13] + "_0" + i[14] if i[-2] == '_' else i for i in z]
             data_dict["shipping_manifest.csv"]["Data_Table"]["Current Label"] = z
     except Exception as e:
-        print(e)
+        display_error_line(e)
     curr_obj.Data_Object_Table = data_dict
     return curr_obj
 
@@ -507,11 +520,11 @@ def check_serology_submissions(s3_client, bucket, assay_data, assay_target, succ
 
 
 def populate_md5_table(pd, sql_tuple, study_type):
-    convert_table = pd.read_sql(("SELECT * FROM Deidentifed_Conversion_Table"), sql_tuple[2])
+    convert_table = pd.read_sql(sd.text("SELECT * FROM Deidentifed_Conversion_Table"), sql_tuple[2])
     if study_type == "Refrence_Pannel":
-        demo_ids = pd.read_sql(("SELECT Research_Participant_ID FROM Participant"), sql_tuple[2])
-        bio_ids = pd.read_sql(("SELECT Biospecimen_ID FROM Biospecimen"), sql_tuple[2])
-        aliquot_ids = pd.read_sql(("SELECT Aliquot_ID FROM Aliquot"), sql_tuple[2])
+        demo_ids = pd.read_sql(sd.text("SELECT Research_Participant_ID FROM Participant"), sql_tuple[2])
+        bio_ids = pd.read_sql(sd.text("SELECT Biospecimen_ID FROM Biospecimen"), sql_tuple[2])
+        aliquot_ids = pd.read_sql(sd.text("SELECT Aliquot_ID FROM Aliquot"), sql_tuple[2])
     elif study_type == "Vaccine_Response":
         pass
     all_ids = set_tables(demo_ids, "Participant_ID")
@@ -522,7 +535,7 @@ def populate_md5_table(pd, sql_tuple, study_type):
     if len(all_ids) > 0:  # new ids need to be added
         all_ids.drop("_merge", inplace=True, axis=1)
         all_ids["MD5_Value"] = [hashlib.md5(i.encode('utf-8')).hexdigest() for i in all_ids["ID_Value"].tolist()]
-        all_ids.to_sql(name="Deidentifed_Conversion_Table", con=sql_tuple[1], if_exists="append", index=False)
+        all_ids.to_sql(name="Deidentifed_Conversion_Table", con=sql_tuple[2], if_exists="append", index=False)
 
 
 def set_tables(df, id_type):
@@ -837,7 +850,7 @@ def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, 
             print('Error Message: {}'.format(error))
 
 
-def send_respond_email(ssm, file_name, error_list, email_msg):
+def send_respond_email(s3_client, bucket, ssm, file_name, error_list, email_msg, s3_zip_file_key):
     http = urllib3.PoolManager()
     USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
     PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
@@ -862,7 +875,15 @@ def send_respond_email(ssm, file_name, error_list, email_msg):
             msg['Subject'] = SUBJECT
             msg['From'] = email.utils.formataddr((SENDERNAME, SENDER))
             if len(error_list) > 0:
-                #msg.attach(attachment)
+                if s3_zip_file_key != "":
+                    s3_object = s3_client.get_object(Bucket=bucket, Key= s3_zip_file_key)
+                    body = s3_object['Body'].read()
+                    filename = os.path.basename(s3_zip_file_key)
+                    attachment = MIMEApplication(body, filename)
+                    attachment.add_header("Content-Disposition", 'attachment', filename = filename)
+                    msg.attach(attachment)
+                    #msg.attach(obj)
+
                 #msg_text += f"\n\nAn Error file was created and attached to this email"
                 msg_text += f"\nLet me know if you have any questions\n"
             msg['To'] = recipient
@@ -873,7 +894,7 @@ def send_respond_email(ssm, file_name, error_list, email_msg):
             print("email has been sent")
 
     except Exception as e:
-        print(e)
+        display_error_line(e)
         #data={"text": display_error_line(e)}
         #r=http.request("POST", slack_fail, body=json.dumps(data), headers={"Content-Type":"application/json"})
 
@@ -888,3 +909,23 @@ def send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient,
     server.sendmail(SENDER, recipient, msg.as_string())
     #print(msg)
     server.close()
+
+def zip_files_from_s3(s3_client, response, bucket_name, prefix, temp_dir, zip_file_name):
+    # Download data validation result to the temporary directory
+    download_files = []
+    zip_file_path = os.path.join(temp_dir, zip_file_name)
+    os.makedirs(temp_dir, exist_ok=True)
+    if 'Contents' in response:
+        for obj in response['Contents']:
+            if obj['Key'].endswith(".csv"):
+                file_key = obj['Key']
+                file_name = os.path.basename(file_key)
+                download_path = os.path.join(temp_dir, file_name)
+                s3_client.download_file(bucket_name, file_key, download_path)
+                download_files.append(download_path)
+    with zipfile.ZipFile(zip_file_path, 'w') as zipf:
+        for file in download_files:
+            zipf.write(file, os.path.basename(file))
+    s3_file_key = os.path.join(prefix, os.path.basename(zip_file_path))
+    response = s3_client.upload_file(zip_file_path, bucket_name, s3_file_key)
+    return s3_file_key
