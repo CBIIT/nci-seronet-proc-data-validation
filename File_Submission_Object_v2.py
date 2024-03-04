@@ -6,6 +6,7 @@ from itertools import compress
 from collections import Counter
 import boto3
 import os
+import sqlalchemy as sd
 ######################################################################################################################
 
 
@@ -591,7 +592,7 @@ class Submission_Object:
             old_data = []
         else:
             old_data = self.Data_Object_Table[file_name]["Data_Table"]
-        curr_table = pd.read_sql((query_str), conn)
+        curr_table = pd.read_sql(sd.text(query_str), conn)
         x = [i for i in curr_table.columns.tolist() if ("Comments" in i) or ("Index" in i)]
         curr_table.drop(x, inplace=True, axis=1)
 
@@ -1125,8 +1126,9 @@ class Submission_Object:
         all_merge.drop_duplicates(inplace=True)
         all_merge.replace({"both": "Found", "left_only": "Missing"}, inplace=True)
 
-        self.check_validation_folder(os)
-        all_merge.to_csv(self.Data_Validation_Path + file_sep + error_table, index=False)
+        self.check_validation_folder()
+        #all_merge.to_csv(self.Data_Validation_Path + file_sep + error_table, index=False)
+        self.to_s3_csv(all_merge, self.Data_Validation_Path + file_sep + error_table, False)
 
     def compare_assay_data(self, sheet_1, sheet_2, key_list, error_msg):
         if ((sheet_1 in self.Data_Object_Table) and (sheet_2 in self.Data_Object_Table)):
@@ -1149,7 +1151,7 @@ class Submission_Object:
                                           str_val, error_msg)
 
     def check_comorbid_dict(self, pd, conn):
-        norm_table = pd.read_sql(("SELECT * FROM Normalized_Comorbidity_Dictionary;"), conn)
+        norm_table = pd.read_sql(sd.text("SELECT * FROM Normalized_Comorbidity_Dictionary;"), conn)
         norm_table.fillna("N/A", inplace=True)
         error_table = pd.DataFrame(columns=["Sheet_Name", "Comorbidity_Catagory", "Comorbidity_Description"])
         miss_terms = []

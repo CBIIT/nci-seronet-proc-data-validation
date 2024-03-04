@@ -1,3 +1,4 @@
+import sqlalchemy as sd
 bio_type_list = ["Serum", "Plasma", "EDTA Plasma", "PBMC", "Blood", "Dried Blood Spot", "Saliva",
                  "Nasal swab", "Bronchoalveolar lavage", "Sputum", "Stool", "Urine", "Breast Milk",
                  "Cerebrospinal Fluid", "Rectal Swab", "Vaginal Swab", "Buccal Swab", "Not Reported", "No Specimens Collected"]
@@ -8,7 +9,7 @@ state_list = ['AK', 'AL', 'AR', 'AZ', 'CA', 'CO', 'CT', 'DC', 'DE', 'FL', 'GA', 
 
 
 def check_serology_shipping(pd, s3_client, bucket, sql_tuple):
-    curr_table = pd.read_sql(("SELECT Barcode_ID, `Material Type` FROM Secondary_Confirm_IDs"), sql_tuple[2])
+    curr_table = pd.read_sql(sd.text("SELECT Barcode_ID, `Material Type` FROM Secondary_Confirm_IDs"), sql_tuple[2])
     key = "Serology_Data_Files/Secondary_Shipping_Manifests/"
     resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
     for curr_file in resp["Contents"]:
@@ -799,7 +800,7 @@ def compare_SARS_tests(current_object, pd, conn):
         confirm_data = current_object.Data_Object_Table["confirmatory_clinical_test.csv"]["Data_Table"]
         if "Interpretation" not in confirm_data.columns:
             return
-        conversion = pd.read_sql(("Select Assay_ID, Target_Organism_Conversion FROM Assay_Organism_Conversion"), conn)
+        conversion = pd.read_sql(sd.text("Select Assay_ID, Target_Organism_Conversion FROM Assay_Organism_Conversion"), conn)
         confirm_data = confirm_data.merge(conversion, how="left")
         confirm_data = confirm_data.query("Target_Organism_Conversion == 'SARS-CoV-2 Virus'")
         confirm_table = pd.crosstab(confirm_data["Research_Participant_ID"], confirm_data["Interpretation"])
@@ -830,7 +831,7 @@ def compare_SARS_tests(current_object, pd, conn):
 
 def check_shipping(current_object, pd, conn):
     file_list = current_object.Data_Object_Table
-    aliquot_table = pd.read_sql(("SELECT Aliquot_ID, Aliquot_Volume FROM `seronetdb-Vaccine_Response`.Aliquot"), conn)
+    aliquot_table = pd.read_sql(sd.text("SELECT Aliquot_ID, Aliquot_Volume FROM `seronetdb-Vaccine_Response`.Aliquot"), conn)
 
     if ("aliquot.csv" in file_list):
         aliquot_df = current_object.Data_Object_Table["aliquot.csv"]["Data_Table"][["Aliquot_ID", "Aliquot_Volume"]]
@@ -1056,7 +1057,7 @@ def check_comorbid_hist(pd, sql_tuple, curr_obj):
 
     if "Diabetes" not in base_table.columns:
         return
-    
+
     visit_table = pd.concat([base_table, followup_table])
     visit_table = visit_table.sort_values(["Research_Participant_ID", "Visit_Number"], ascending=(True, True))
     uni_part = list(set(visit_table["Research_Participant_ID"].tolist()))
@@ -1103,7 +1104,7 @@ def check_vacc_hist(pd, sql_tuple, curr_obj):
         return
     data_table = curr_obj.Data_Object_Table
 
-    visit_list = pd.read_sql(("SELECT Visit_Info_ID FROM Participant_Visit_Info;"), sql_tuple[2])
+    visit_list = pd.read_sql(sd.text("SELECT Visit_Info_ID FROM Participant_Visit_Info;"), sql_tuple[2])
     visit_list = visit_list["Visit_Info_ID"].tolist()
 
     visit_list = get_visit_list(visit_list, "baseline.csv", data_table)  # new visits from baseline
@@ -1113,14 +1114,13 @@ def check_vacc_hist(pd, sql_tuple, curr_obj):
     all_list['Research_Participant_ID'] = [i[:9] for i in all_list["Visit_Info_ID"]]
     try:
         filt_visit = curr_obj.All_Part_ids.merge(all_list)
-        #print(filt_visit)
     except Exception as e:
         print(e)
 
     if "covid_history.csv" in curr_obj.rec_file_names:
         x = data_table["covid_history.csv"]["Data_Table"].merge(filt_visit, how="right", on="Visit_Info_ID", indicator=True)
         error_data = x.query("_merge not in ['both']")
-        covid_db = pd.read_sql(("SELECT * FROM Covid_History"), sql_tuple[2])
+        covid_db = pd.read_sql(sd.text("SELECT * FROM Covid_History"), sql_tuple[2])
         error_data = error_data.merge(covid_db["Visit_Info_ID"], how="left", indicator="Check_DB")
         error_data = error_data.query("Check_DB not in ['both']")
 
@@ -1136,7 +1136,7 @@ def check_vacc_hist(pd, sql_tuple, curr_obj):
         x = vacc_table.merge(filt_visit, how="right", on="Visit_Info_ID", indicator=True)
         error_data = x.query("_merge not in ['both']")
         error_msg = "Visit was found in baseline or followup, but there is no event information in covid_vaccination_status"
-        covid_db = pd.read_sql(("SELECT * FROM Covid_Vaccination_Status"), sql_tuple[1])
+        covid_db = pd.read_sql(sd.text("SELECT * FROM Covid_Vaccination_Status"), sql_tuple[2])
         error_data = error_data.merge(covid_db["Visit_Info_ID"], how="left", indicator="Check_DB")
         error_data = error_data.query("Check_DB not in ['both']")
 
@@ -1159,7 +1159,7 @@ def check_vacc_hist(pd, sql_tuple, curr_obj):
                                                   ascending=[True, True])
             except Exception as e:
                 print(e)
-            data_db = pd.read_sql((f"SELECT Vaccination_Status FROM Covid_Vaccination_Status where Research_Participant_ID = '{curr_id}';"), sql_tuple[1])
+            data_db = pd.read_sql(sd.text(f"SELECT Vaccination_Status FROM Covid_Vaccination_Status where Research_Participant_ID = '{curr_id}';"), sql_tuple[2])
             vacc_list = curr_part["Vaccination_Status"].tolist() + data_db["Vaccination_Status"].tolist()
 
             miss_d1 = "Dose 2 of 2" in vacc_list and "Dose 1 of 2" not in vacc_list
@@ -1229,7 +1229,7 @@ def make_dict(curr_obj, master_dict, filt_table, type_var, cat_var, index):
 
 def check_baseline_date(current_object, pd, sql_tuple, parse):
     data_table = current_object.Data_Object_Table["baseline_visit_date.csv"]["Data_Table"]
-    part_list = pd.read_sql(("SELECT Research_Participant_ID FROM Participant"), sql_tuple[1])
+    part_list = pd.read_sql(sd.text("SELECT Research_Participant_ID FROM Participant"), sql_tuple[2])
 
     missing = data_table.merge(part_list, indicator=True, how="left")
     has_data = missing.query("_merge in ['both']")
@@ -1245,7 +1245,7 @@ def check_baseline_date(current_object, pd, sql_tuple, parse):
             part_id = good_data["Research_Participant_ID"][i]
             sql_query = (f"update `seronetdb-Vaccine_Response`.Participant set Sunday_Prior_To_First_Visit = '{visit_day}' " +
                         f"where Research_Participant_ID = '{part_id}'")
-            sql_tuple[1].execute(sql_query)
+            sql_tuple[2].execute(sd.text(sql_query))
         except Exception as e:
             print(e)
         finally:
