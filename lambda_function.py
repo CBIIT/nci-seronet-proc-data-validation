@@ -1,359 +1,442 @@
-import time
-import pandas as pd
-import sqlalchemy as sd
-import os
-import re
-import yaml
-import datetime
 import warnings
-from dateutil.parser import parse
-import dateutil
-import boto3
-import hashlib
-import urllib3
-import json
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
+import email.utils
+import yaml
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
-import email.utils
 import smtplib
-import zipfile
-#from get_data_to_check_v2 import get_summary_file
-#import db_loader_ref_pannels
-# import db_loader_vac_resp
-#import db_loader_v4
-#from bio_repo_map import bio_repo_map
+import json
+import boto3
+import re
+import os
+from dateutil.parser import parse
+import datetime
+import numpy as np
+#from import_loader_v2 import pd, np, pd_s3, boto3, datetime, os, re
+#from import_loader_v2 import get_box_data_v2, parse, pathlib
+#import mysql.connector
+import copy
+import pathlib
+import urllib3
+from decimal import Decimal
+import pandas as pd
+import sqlalchemy as sd
+#import get_box_data_v2
+error_msg = list()
+success_msg = list()
 
-#from connect_to_sql_db import connect_to_sql_db
-from File_Submission_Object_v2 import Submission_Object
-import Validation_Rules_v2 as vald_rules
-#########################################################################################hhh####
-#  import templates abd CBC codes directly from box
-#  connect to S3 client and return handles for future use
 def lambda_handler(event, context):
-    start_time = time.time()
-    bucket = event["Records"][0]["s3"]["bucket"]["name"]
-    print("## Running Set Up Functions")
-    file_sep, s3_client, s3_resource, Support_Files, validation_date = set_up_function(bucket)
-    #study_type = "Refrence_Pannel"
-    study_type = "Vaccine_Response"
-    template_df, dbname = get_template_data(s3_client, study_type, bucket)
-    print("Initialization took %.2f seconds" % (time.time() - start_time))
+    global error_msg
+    global success_msg
+    error_msg.clear()
+    success_msg.clear()
+    #print(error_msg)
+    #print(success_msg)
+    # TODO implement
+    s3_client = boto3.client("s3")
     ssm = boto3.client("ssm")
-    file_path = event["Records"][0]["s3"]["object"]["key"]
-    cbc_name_list = {"cbc01" : ["Feinstein_CBC01", 41], "cbc02": ["UMN_CBC02", 27], "cbc03": ["ASU_CBC03", 32], "cbc04": ["Mt_Sinai_CBC04",14]}
-    # Accrual_Need_To_Validate/cbc01/2023-04-20-12-59-25/submission_007_Prod_data_for_feinstein20230420_VaccinationProject_Batch9_shippingmanifest.zip/File_Validation_Results/Result_Message.txt
-    file_path = file_path.replace("+", " ")         #some submissions might have spaces this line corrects the "+" replacement
-    curr_cbc = file_path.split("/")[1] #should be 1 if the path is under need_to_validate function
-    sub_name = file_path.split("/")[3][15:]
-    site_name = cbc_name_list[curr_cbc][0]
-    passed_bucket = ssm.get_parameter(Name="data_validation_passed_bucket", WithDecryption=True).get("Parameter").get("Value")
-    fail_bucket = ssm.get_parameter(Name="data_validation_failed_bucket", WithDecryption=True).get("Parameter").get("Value")
-    slack_pass = ssm.get_parameter(Name="success_hook_url", WithDecryption=True).get("Parameter").get("Value")
-    USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
-    PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
-    error_message = Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm, passed_bucket)
-    slack_fail = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
-    
-    data_validation_prefix = os.path.dirname(file_path).replace("File_Validation_Results", "Data_Validation_Results")
-    temp_dir = '/tmp/'
-    zip_file_name = [i for i in data_validation_prefix.split(os.sep) if ".zip" in i][0].replace(".zip", "_data_validation_result.zip")
-    s3_file_key = ""
-    data_validation_response = s3_client.list_objects_v2(Bucket=bucket, Prefix=data_validation_prefix)
-    # Download and zip files from S3
-    if "Contents" in data_validation_response.keys():
-        s3_file_key = zip_files_from_s3(s3_client, data_validation_response, bucket, data_validation_prefix, temp_dir, zip_file_name)
-
-    warning_message = []
-    for msg in error_message['message']:
-        if "Cross_Sheet_Comobidity.csv" in msg or "Missing_Visit_Info" in msg:
-            warning_message.append(msg)
-    if len(error_message['message']) - len(warning_message) > 1:
-        message_slack_fail = "Your data submission " + sub_name +" has been analyzed by the validation software.\n"
-        if error_message["message_type"] == "data_validation_error":
-            for i in range(0, len(error_message['message'])):
-                if i != len(error_message['message']) - 1:
-                    message_slack_fail = message_slack_fail + str(i + 1) + ") " + error_message['message'][i] + "\n"
-                else:
-                    message_slack_fail = message_slack_fail + error_message['message'][i] + "\n"
-        else:
-            for m in error_message['message']:
-                message_slack_fail = message_slack_fail + m + "\n"
-        write_to_slack(message_slack_fail, slack_fail)
-        move_submission(bucket, fail_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
-        send_respond_email(s3_client, bucket, ssm, sub_name, list(error_message['message']), message_slack_fail, s3_file_key)
-    else:
-        message_slack_success = "Your data submission " + sub_name + " has been analyzed by the validation software.\n" + "1) Analysis of the Zip File: Passed\n" + "2) Data Validation: Passed\n"
-        if len(warning_message) > 0:
-            for i in range(0, len(warning_message)):
-                message_slack_success = message_slack_success + str(i + 3) + ") " + "Warning: " + warning_message[i] + "\n"
-        write_to_slack(message_slack_success, slack_pass)
-        move_submission(bucket, passed_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
-        send_respond_email(s3_client, bucket, ssm, sub_name, warning_message, message_slack_success, s3_file_key)
-
-
-
-def Data_Validation_Main(study_type, template_df, dbname, s3_client, s3_resource, Support_Files, validation_date, file_sep, curr_cbc, file_path, bucket, ssm, passed_bucket):
-    error_message = {"message_type": '', "message": []}
-    if len(template_df) == 0:
-        print("Study Name was not found, please correct")
-        error_message['message_type'] = "study_not_found"
-        error_message['message'].append("Study Name was not found, please correct")
-        return error_message
-
-    #root_dir = "C:\\Seronet_Data_Validation"  # Directory where Files will be downloaded
-    ignore_validation_list = ["submission.csv", "assay.csv", "assay_target.csv", "baseline_visit_date.csv"]
-    check_BSI_tables = False
-    make_rec_report = False
-    #upload_ref_data = False
-##############################################################################################
-    start_time = time.time()
+    http = urllib3.PoolManager()
     host_client = ssm.get_parameter(Name="db_host", WithDecryption=True).get("Parameter").get("Value")
     user_name = ssm.get_parameter(Name="lambda_db_username", WithDecryption=True).get("Parameter").get("Value")
     user_password =ssm.get_parameter(Name="lambda_db_password", WithDecryption=True).get("Parameter").get("Value")
-    sql_tuple = connect_to_sql_db(host_client, user_name, user_password, dbname)
-    print("Connection to SQL database took %.2f seconds" % (time.time() - start_time))
-    '''
-    if upload_ref_data is True and study_type == "Refrence_Pannel":
-        #  db_loader_ref_pannels.write_panel_to_db(sql_tuple, s3_client, bucket)
-        db_loader_ref_pannels.write_requests_to_db(sql_tuple, s3_client, bucket)
-        db_loader_ref_pannels.make_manifests(sql_tuple, s3_client, s3_resource, bucket)
-        return
-    '''
-    if make_rec_report is True:
-        generate_rec_report(sql_tuple, s3_client, cbc_bucket)
-###############################################################################################
-#    if check_BSI_tables is True:
-#        check_bio_repo_tables(s3_client, s3_resource, study_type)  # Create BSI report using file in S3 bucket
-###############################################################################################
-    cbc_bucket = passed_bucket #some files are in the pass bucket
-    if study_type == "Refrence_Pannel":
-        # sql_table_dict = db_loader_ref_pannels.Db_loader_main(sql_tuple, validation_date)
-
-        sql_table_dict = get_sql_dict_ref(s3_client, cbc_bucket)
-    elif study_type == "Vaccine_Response":
-        sql_table_dict = get_sql_dict_vacc(s3_client, cbc_bucket)
-#############################################################################################
-# compares S3 destination to S3-Passed and S3-Failed to get list of submissions to work
+    bucket_name = event['Records'][0]['s3']['bucket']['name']
+    sub_folder = "Vaccine Response Submissions"
+    #set up parameters base on the event
+    Update_Assay_Data = False
+    Update_Study_Design = False
+    Update_BSI_Tables = False
+    Add_Blinded_Results = False
+    update_CDC_tables = False
+    key_list = []
+    db_name = "seronetdb-Vaccine_Response"
+    for record in event['Records']:
+        key_list.append(record['s3']['object']['key'])
+    if any('Serology_Data_Files/Reference_Panel_Files/Reference_Panel_Submissions/' in key for key in key_list):
+        Add_Blinded_Results = True
+    if any('CBC_Folders/Assay_Data/' in key for key in key_list):
+        Update_Assay_Data = True
+    if any('Vaccine_Respone_Study_Design/' in key for key in key_list):
+        Update_Study_Design = True
+    if any('Serology_Data_Files/biorepository_id_map/' in key for key in key_list):
+        Update_BSI_Tables = True
+    if any('Reference+Panel+Submissions' in key for key in key_list):
+        sub_folder = 'Reference Panel Submissions'
+        db_name = "seronetdb-Validated"
     try:
-#############################################################################################
-# pulls the all assay data directly from box
-        start_time = time.time()
-        #assay_data, assay_target, all_qc_data, converion_file = get_box_data_v2.get_assay_data("CBC_Data")
-        assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", cbc_bucket)
-        #assay_data = pd.read_sql(("Select * from Study_Design"), sql_tuple[1])
-        study_design = pd.read_sql(sd.text("Select * from Study_Design"), sql_tuple[2])
-        study_design.drop("Cohort_Index", axis=1, inplace=True)
-        #get_box_data_v2.get_study_design()
+        connection_tuple = connect_to_sql_db(host_client, user_name, user_password, db_name)
+        kwargs = {'Update_Assay_Data': Update_Assay_Data, 'Update_Study_Design': Update_Study_Design, 'Update_BSI_Tables': Update_BSI_Tables, 'Add_Blinded_Results': Add_Blinded_Results, "update_CDC_tables": update_CDC_tables}
+        file_key = key_list[0]
+        sql_table_dict, all_submissions = Db_loader_main(file_key, sub_folder, connection_tuple, s3_client, bucket_name, **kwargs)
+        if db_name == "seronetdb-Vaccine_Response" and len(all_submissions) > 0:
+            TopicArn_make_time_line = ssm.get_parameter(Name="TopicArn_make_time_line", WithDecryption=True).get("Parameter").get("Value")
+            res=sns_publisher("make_time_line",TopicArn_make_time_line)
+    except Exception as e:
+        error_msg.append(str(e))
+        display_error_line(e)
+        #raise(e)
+    #finally:
+        #delete_data_files(bucket_name, file_key)
+    ''''''
+    email_host = "email-smtp.us-east-1.amazonaws.com"
+    email_port = 587
+    USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
+    PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
+    SENDER = ssm.get_parameter(Name="sender-email", WithDecryption=True).get("Parameter").get("Value")
+    RECIPIENT_RAW = ssm.get_parameter(Name="SQL_Database_Uploader_Recipents", WithDecryption=True).get("Parameter").get("Value")
+    RECIPIENT = RECIPIENT_RAW.replace(" ", "")
+    RECIPIENT_LIST = RECIPIENT.split(",")
+    SUBJECT = 'SQL Database Uploader'
+    SENDERNAME = 'SeroNet Data Team (Data Curation)'
 
-        print("\nLoading Assay Data took %.2f seconds" % (time.time()-start_time))
-############################################################################################
-        # reference pannel study is over
-        '''
-        if study_type == "Refrence_Pannel":
-            check_serology_submissions(s3_client, bucket, assay_data, assay_target, success_msg, error_msg, study_type)
-            vald_rules.check_serology_shipping(pd, s3_client, bucket, sql_tuple)
-        '''
-############################################################################################
-# Creates Sub folders to place submissions in based on validation results
-        file_folder_key = os.path.dirname(os.path.split(file_path)[0])
-        print(file_folder_key)
-        print(bucket)
-        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=file_folder_key)
-        file_list = resp['Contents']
-        #print(resp)
-#############################################################################################
-        if len(file_list) == 0:
-            print("\nThe Files_To_Validate Folder is empty, no Submissions Downloaded to Process\n")
-#############################################################################################
+    if len(error_msg) > len(all_submissions):
+        message_slack_fail = ""
+        for error_message in error_msg:
+            message_slack_fail = message_slack_fail + '\n'+ error_message
+        failure = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
+        message_slack_fail = message_slack_fail + '\n'+ 'The data was failed to be uploaded into the database'
+        print('The data was failed to be uploaded into the database')
+        data={"text": message_slack_fail}
+        r=http.request("POST", failure, body=json.dumps(data), headers={"Content-Type":"application/json"})
 
-        print("\n##    Starting Data Validation for " + curr_cbc + "    ##")
-        #file_list = check_if_done(file_list)
-        file_path, file_name = os.path.split(file_folder_key)         # gets file path and file name
-        curr_date = os.path.split(file_path)[1]                    # trims date from file path
-        list_of_files = [i['Key'] for i in file_list if "UnZipped_Files" in i['Key']]
-        result_key = os.path.join(file_folder_key, "File_Validation_Results/Result_Message.txt")
-        passing_msg = "File Passed File-Validation"
-        result_message = check_passed_file_validation(result_key, file_list, bucket, s3_client)
-        if result_message != passing_msg: #if the file fail the file validation
-            #move_target_folder(curr_date, file_sep, file_path, "01_Failed_File_Validation")
-            print("Analysis of the Zip File: Failed, " + result_message)
-            error_message['message_type'] = 'file_validation'
-            error_message['message_type'].append("Analysis of the Zip File: Failed, " + result_message)
-            #  update excel file
-        else:
-            print("Analysis of the Zip File: Passed, " + result_message)
-            if "submission" in file_name:
-                current_sub_object = Submission_Object(file_name[15:])  # creates the Object
+        for recipient in RECIPIENT_LIST:
+            msg_text = message_slack_fail
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = SUBJECT
+            msg['From'] = email.utils.formataddr((SENDERNAME, SENDER))
+            part1 = MIMEText(msg_text, "plain")
+            msg.attach(part1)
+            msg['To'] = recipient
+            send_email_func(email_host, email_port, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg)
+
+    #send the message to slack channel
+    else:
+        message_slack_success = ""
+        for success_message in success_msg:
+            message_slack_success = message_slack_success + '\n'+ success_message
+        #send the message to slack channel
+        message_slack_success = message_slack_success + '\n' + 'The data was successfully uploaded into the database'
+        print('The data was successfully uploaded into the database')
+        data={"text": message_slack_success}
+        success = ssm.get_parameter(Name="success_hook_url", WithDecryption=True).get("Parameter").get("Value")
+        r=http.request("POST", success, body=json.dumps(data), headers={"Content-Type":"application/json"})
+
+        for recipient in RECIPIENT_LIST:
+            msg_text = message_slack_success
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = SUBJECT
+            msg['From'] = email.utils.formataddr((SENDERNAME, SENDER))
+            part1 = MIMEText(msg_text, "plain")
+            msg.attach(part1)
+            msg['To'] = recipient
+            send_email_func(email_host, email_port, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg)
+
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Hello from Lambda!')
+    }
+
+def connect_to_sql_db(host_client, user_name, user_password, file_dbname):
+    global error_msg
+    #host_client = "Host Client"
+    #user_name = "User Name"
+    #user_password = "User Password"
+    #file_dbname = "Name of database"
+
+    sql_column_df = pd.DataFrame(columns=["Table_Name", "Column_Name", "Var_Type", "Primary_Key", "Autoincrement",
+                                          "Foreign_Key_Table", "Foreign_Key_Column"])
+    creds = {'usr': user_name, 'pwd': user_password, 'hst': host_client, "prt": 3306, 'dbn': file_dbname}
+    connstr = "mysql+mysqlconnector://{usr}:{pwd}@{hst}:{prt}/{dbn}"
+    engine = sd.create_engine(connstr.format(**creds))
+    engine = engine.execution_options(autocommit=False)
+    conn = engine.connect()
+    metadata = sd.MetaData()
+    metadata.reflect(engine)
+
+    for t in metadata.tables:
+        try:
+            curr_table = metadata.tables[t]
+            curr_table = curr_table.columns.values()
+            for curr_row in range(len(curr_table)):
+                curr_dict = {"Table_Name": t, "Column_Name": str(curr_table[curr_row].name),
+                             "Var_Type": str(curr_table[curr_row].type),
+                             "Primary_Key": str(curr_table[curr_row].primary_key),
+                             "Autoincrement": False,
+                             "Foreign_Key_Count": 0,
+                             "Foreign_Key_Table": 'None',
+                             "Foreign_Key_Column": 'None'}
+                curr_dict["Foreign_Key_Count"] = len(curr_table[curr_row].foreign_keys)
+                if curr_table[curr_row].autoincrement is True:
+                    curr_dict["Autoincrement"] = True
+                if len(curr_table[curr_row].foreign_keys) == 1:
+                    key_relation = list(curr_table[curr_row].foreign_keys)[0].target_fullname
+                    key_relation = key_relation.split(".")
+                    curr_dict["Foreign_Key_Table"] = key_relation[0]
+                    curr_dict["Foreign_Key_Column"] = key_relation[1]
+
+
+                sql_column_df = pd.concat([sql_column_df, pd.DataFrame.from_records([curr_dict])])
+        except Exception as e:
+            error_msg.append(str(e))
+            display_error_line(e)
+    print("## Sucessfully Connected to " + file_dbname + " ##")
+    sql_column_df.reset_index(inplace=True, drop=True)
+    return sql_column_df, engine, conn
+
+def send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg):
+    server = smtplib.SMTP(HOST, PORT)
+    server.ehlo()
+    server.starttls()
+    #stmplib docs recommend calling ehlo() before & after starttls()
+    server.ehlo()
+    server.login(USERNAME_SMTP, PASSWORD_SMTP)
+
+    server.sendmail(SENDER, recipient, msg.as_string())
+    server.close()
+
+
+
+
+def Db_loader_main(file_key, sub_folder, connection_tuple, s3_client, bucket_name, **kwargs):
+    global error_msg
+    global success_msg
+    """main function that will import data from s3 bucket into SQL database"""
+    pd.options.mode.chained_assignment = None
+    #s3_client = boto3.client('s3', aws_access_key_id=aws_creds_prod.aws_access_id, aws_secret_access_key=aws_creds_prod.aws_secret_key,region_name='us-east-1')
+    #bucket_name = "nci-cbiit-seronet-submissions-passed"
+    #bucket_name = "seronet-demo-submissions-passed"
+    data_release = "2.0.0"
+
+    if sub_folder == "Reference Panel Submissions":
+        sql_table_dict = get_sql_dict_ref(s3_client, bucket_name)
+    elif sub_folder == "Vaccine Response Submissions":
+        sql_table_dict = get_sql_dict_vacc(s3_client, bucket_name)
+    else:
+        return
+    Update_Assay_Data = get_kwarg_parms("Update_Assay_Data", kwargs)
+    Update_Study_Design = get_kwarg_parms("Update_Study_Design", kwargs)
+    Update_BSI_Tables = get_kwarg_parms("Update_BSI_Tables", kwargs)
+    loading_result = ''
+############################################################################################################################
+    try:
+        conn = connection_tuple[2]
+        engine = connection_tuple[1]
+        sql_column_df = connection_tuple[0]
+
+        done_submissions = pd.read_sql(("SELECT * FROM Submission"), conn)  # list of all submissions previously done in db
+        done_submissions.drop_duplicates("Submission_S3_Path", inplace=True)
+
+        all_submissions = []  # get list of all submissions by CBC
+        cbc_code = []
+        all_submissions, cbc_code = get_all_submissions(s3_client, bucket_name, sub_folder, "Feinstein_CBC01", 41, all_submissions, cbc_code)
+        all_submissions, cbc_code = get_all_submissions(s3_client, bucket_name, sub_folder, "UMN_CBC02", 27, all_submissions, cbc_code)
+        all_submissions, cbc_code = get_all_submissions(s3_client, bucket_name, sub_folder, "ASU_CBC03", 32, all_submissions, cbc_code)
+        all_submissions, cbc_code = get_all_submissions(s3_client, bucket_name, sub_folder, "Mt_Sinai_CBC04", 14, all_submissions, cbc_code)
+        #all_submissions = [os.path.dirname(file_key)]
+        file_key = os.path.dirname(file_key)
+        file_key = file_key.replace("+", " ").replace("%28","(").replace("%29",")")
+
+        all_submissions = [i for i in all_submissions if file_key in i]
+        time_stamp = [i.split("/")[2] for i in all_submissions]
+        for i in time_stamp:
+            if i[2] == '-':
+                time_stamp[time_stamp.index(i)] = datetime.datetime.strptime(i, "%H-%M-%S-%m-%d-%Y")
             else:
-                current_sub_object = Submission_Object(file_name)  # creates the Object
+                time_stamp[time_stamp.index(i)] = datetime.datetime.strptime(i, "%Y-%m-%d-%H-%M-%S")
+
+        #  sort need to work by date time
+        all_submissions = [x for _, x in sorted(zip(time_stamp, all_submissions))]  # sort submission list by time submitted
+        cbc_code = [x for _, x in sorted(zip(time_stamp, cbc_code))]  # sort submission list by time submitted
+
+        all_submissions = [i for i in enumerate(zip(all_submissions, cbc_code))]
+        # Filter list by submissions already done
+        all_submissions = [i for i in all_submissions if i[1][0] not in done_submissions["Submission_S3_Path"].tolist()]
+        print(all_submissions)
+        #  all_submissions = [i for i in all_submissions if "CBC02" in i[1][0]]
+
+    except Exception as e:
+        all_submissions = []
+        error_msg.append(str(e))
+        #display_error_line(e)
+        raise(e)
+############################################################################################################################
+    master_dict = {}  # dictionary for all submissions labeled as create
+    update_dict = {}  # dictionary for all submissions labeled as update
+    #  all_submissions = [(99, done_submissions["Submission_S3_Path"].tolist()[99])]
+    #  all_submissions = all_submissions[-5:]
+
+    try:
+        i = 1
+        for curr_sub in all_submissions:
             try:
-                current_sub_object.initalize_parms(file_folder_key, template_df,
-                                                    sql_tuple[0], sql_table_dict, bucket, s3_client)
-            except PermissionError:
-                print("One or more files needed is open, not able to proceed")
-                #return?
-
-            print("\n## Starting the Data Validation Proccess for " + current_sub_object.File_Name + " ##")
-
-            try:
-                current_sub_object, study_name = populate_object(current_sub_object, list_of_files, Support_Files, study_type)
-                if study_name != study_type:
-                    print(f"##  Submission not in {study_type}, correct and rerun ##")
-                    error_message['message_type'] = "submission_validation_error"
-                    error_message['message'] = error_message['message'].append("Submission not in {study_type}, correct and rerun")
-                    #continue
-                    return error_message
-                col_error_message = ''
-                col_err_count, col_error_message = current_sub_object.check_col_errors(file_folder_key)
-
-                if col_err_count > 0:
-                    print("Submission has Column Errors, Data Validation NOT Preformed")
-                    error_message['message_type'] = "submission_validation_error"
-                    error_message['message'].append(col_error_message)
-                    error_message['message'].append("Submission has Column Errors, Data Validation NOT Preformed")
-                    #continue
-                    return error_message
-                current_sub_object = zero_pad_ids(current_sub_object)
-                current_sub_object.get_all_unique_ids(re)
-                current_sub_object.rec_file_names = list(current_sub_object.Data_Object_Table.keys())
-                current_sub_object.populate_missing_keys(sql_tuple)
-                data_table = current_sub_object.Data_Object_Table
-                empty_list = []
-
-                for file_name in data_table:
-                    current_sub_object.set_key_cols(file_name, study_type)
-                    if len(data_table[file_name]["Data_Table"]) == 0 and "visit_info_sql.csv" not in file_name:
-                        empty_list.append(file_name)
-                for index in empty_list:
-                    del current_sub_object.Data_Object_Table[index]
+                #index = curr_sub[0]# + 1
+                index = max(done_submissions["Submission_Index"].tolist()) + i
+                i += 1
             except Exception as e:
+                error_msg.append(str(e))
                 display_error_line(e)
-                #continue
-                return
-            try:
-                current_sub_object.create_visit_table("baseline.csv", study_type)
-                current_sub_object.create_visit_table("follow_up.csv", study_type)
-            except Exception as e:
-                display_error_line(e)
-                print("Submission does not match study type, visit info is missing")
 
-            current_sub_object.update_object(assay_data, "assay.csv")
-            current_sub_object.update_object(assay_target, "assay_target.csv")
-            current_sub_object.update_object(study_design, "study_design.csv")
+            folder_path, folder_tail = os.path.split(curr_sub[1][0])
+            file_name = curr_sub[1][0].split("/")
+            folders = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=folder_path)["Contents"]
+            print(f"\nWorking on Submision #{index}: {file_name[1]}:  {file_name[2]} \n {file_name[3]}")
+            success_msg.append(f"Working on Submision #{index}: {file_name[1]}:  {file_name[2]} {file_name[3]}")
+            error_msg.append(f"Working on Submision #{index}: {file_name[1]}:  {file_name[2]} {file_name[3]}")
 
-            data_table = current_sub_object.Data_Object_Table
-            if "baseline_visit_date.csv" in data_table:
-                current_sub_object.Data_Object_Table = {"baseline_visit_date.csv": data_table["baseline_visit_date.csv"]}
+            upload_date, intent, sub_name = get_upload_info(s3_client, bucket_name, curr_sub, sub_folder)  # get submission info
+            if intent == "Create":
+                master_dict = get_tables_to_load(s3_client, bucket_name, folders, curr_sub, conn, sub_name, index, upload_date, intent, master_dict, data_release)
+            elif intent == "Update":
+                update_dict = get_tables_to_load(s3_client, bucket_name, folders, curr_sub, conn, sub_name, index, upload_date, intent, update_dict, data_release)
+            else:
+                print(f"Submission Intent: {intent} is not valid")
 
-            valid_cbc_ids = str(current_sub_object.CBC_ID)
-            for file_name in current_sub_object.Data_Object_Table:
-                try:
-                    if file_name in ignore_validation_list or "_sql.csv" in file_name:
-                        continue
-                    if "Data_Table" in current_sub_object.Data_Object_Table[file_name]:
-                        data_table = current_sub_object.Data_Object_Table[file_name]['Data_Table']
-                        data_table.fillna("N/A", inplace=True)
-                        data_table = current_sub_object.correct_var_types(file_name, study_type)
-                except Exception as e:
-                    display_error_line(e)
-            for file_name in current_sub_object.Data_Object_Table:
-                tic = time.time()
-                try:
-                    if file_name in ignore_validation_list or "_sql.csv" in file_name:
-                        continue
-                    if "Data_Table" in current_sub_object.Data_Object_Table[file_name]:
-                        print(file_name)
-                        data_table, drop_list = current_sub_object.merge_tables(file_name)
-                        current_sub_object.Data_Object_Table[file_name]['Data_Table'] = data_table.drop(drop_list, axis=1)
-                        current_sub_object.Data_Object_Table[file_name]['Data_Table'].drop_duplicates(inplace=True)
-                        current_sub_object = vald_rules.Validation_Rules(re, datetime, current_sub_object, data_table,
-                                                                            file_name, valid_cbc_ids, drop_list, study_type)
-                        if file_name in current_sub_object.rec_file_names:
-                            current_sub_object.check_dup_visit(pd, data_table, drop_list, file_name)
-                        toc = time.time()
-                        print(f"{file_name} took %.2f seconds" % (toc-tic))
-                    else:
-                        print(file_name + " was not included in the submission")
-                except Exception as e:
-                    display_error_line(e)
-            vald_rules.check_ID_Cross_Sheet(current_sub_object, re, file_sep, study_name)
-            if file_name in ["baseline_visit_date.csv"]:
-                vald_rules.check_baseline_date(current_sub_object, pd, sql_tuple, parse)
-            elif study_type == "Vaccine_Response":
-                current_sub_object.compare_visits("baseline")
-                current_sub_object.compare_visits("followup")
-                vald_rules.check_comorbid_hist(pd, sql_tuple, current_sub_object)
-                vald_rules.check_vacc_hist(pd, sql_tuple, current_sub_object)
-                current_sub_object.check_comorbid_dict(pd, sql_tuple[2])
-            elif study_type == "Refrence_Pannel":
-                vald_rules.compare_SARS_tests(current_sub_object, pd, sql_tuple[2])
-            vald_rules.check_shipping(current_sub_object, pd, sql_tuple[2])
-            try:
-                dup_visits = current_sub_object.dup_visits
-                if len(dup_visits) > 0:
-                    dup_visits = dup_visits.query("File_Name in ['baseline.csv', 'follow_up.csv']")
-                    dup_count = len(dup_visits)
-                else:
-                    dup_count = 0
-                err_count = len(current_sub_object.Error_list)
-                current_sub_object.write_error_file(file_sep)
+        master_dict = fix_aliquot_ids(master_dict, "last", sql_column_df)
+        update_dict = fix_aliquot_ids(update_dict, "last", sql_column_df)
+        master_data_dict = get_master_dict(master_dict, update_dict, sql_column_df, sql_table_dict)
 
-                if dup_count > 0:
-                    print("Duplicate Visit Information was found")
-                    #dup_visits.to_csv(current_sub_object.Data_Validation_Path + file_sep + "Duplicate_Visit_ID_Errors.csv", index=False)
-                    to_s3_csv(dup_visits, current_sub_object.Data_Validation_Path + file_sep + "Duplicate_Visit_ID_Errors.csv", False, bucket, s3_client)
-                if err_count == 0 and dup_count == 0:
-                    error_str = "No Errors were Found during Data Validation"
-    #                        move_target_folder(curr_date, file_sep, file_path, "02_Passed_Data_Validation")
-                    print(error_str)
-                else:
-                    error_str = ("Data Validation found " + str(len(current_sub_object.Error_list)) +
-                                    " errors in the submitted files")
-                    error_message['message_type'] = 'data_validation_error'
-                    uni_name = list(set(current_sub_object.Error_list["CSV_Sheet_Name"]))
-                    for iterU in uni_name:
-                        curr_table = current_sub_object.Error_list.query("CSV_Sheet_Name == @iterU")
-                        error_message['message'].append(iterU + " has " + str(len(curr_table)) + " Errors")
-                    error_message['message'].append("Data Validation found " + str(len(current_sub_object.Error_list)) + " errors in the submitted files")
-                    # current_sub_object.split_into_error_files(os, file_sep)
-    #                        move_target_folder(curr_date, file_sep, file_path, "04_Failed_Data_Validation")
-                    print(error_str)
-            except Exception as err:
-                print("An Error Occured when trying to write output file")
-                display_error_line(err)
+        #if "baseline_visit_date.csv" in master_data_dict and "baseline.csv" in master_data_dict:
+        #    x = master_data_dict["baseline_visit_date.csv"]["Data_Table"]
+        #    x.rename(columns={"Sunday_Of_Week": "Sunday_Prior_To_First_Visit"}, inplace=True)
+        #    x["Sunday_Prior_To_First_Visit"] = pd.to_datetime(x["Sunday_Prior_To_First_Visit"])#
+        #
+        #    for curr_part in x.index:
+        #        sql_qry = (f"update Participant set Sunday_Prior_To_First_Visit = '{x['Sunday_Prior_To_First_Visit'][curr_part].date()}' " +
+        #                   f"where Research_Participant_ID = '{x['Research_Participant_ID'][curr_part]}'")
+        #        engine.execute(sql_qry)
+        #        conn.connection.commit()
+        #
+        #    y = master_data_dict["baseline.csv"]
+        #    y = master_data_dict["baseline.csv"]["Data_Table"]
+        #    master_data_dict["baseline.csv"]["Data_Table"] = y.merge(x[["Research_Participant_ID","Sunday_Prior_To_First_Visit"]])
+        #    master_data_dict = {"baseline.csv": master_data_dict["baseline.csv"]}
+
+        if "baseline.csv" in master_data_dict:
+            master_data_dict = update_obesity_values(master_data_dict)
+            x = master_dict['baseline.csv']["Data_Table"]
+            #x = x.query("Age > 0")
+            master_dict['baseline.csv']["Data_Table"] = x.drop_duplicates('Research_Participant_ID')
+        #if study_type == "Vaccine_Response":
+        #    cohort_file = r"C:\Users\breadsp2\Downloads\Release_1.0.0_by_cohort.xlsx"
+        #    x = pd.read_excel(cohort_file)
+        #    visit_table = pd.read_sql(("SELECT * FROM `seronetdb-Vaccine_Response`.Participant_Visit_Info;"), sql_tuple[1])
+        #    x.drop("CBC", axis=1, inplace=True)
+        #    visit_table.rename(columns={"Cohort": "CBC_Grouping"}, inplace=True)
+        #    y = visit_table.merge(x)
+        #    update_tables(conn, engine, ["Visit_Info_ID"], y, "Participant_Visit_Info")
+        if Update_Assay_Data is True:
+            master_data_dict = upload_assay_data(master_data_dict, bucket_name, s3_client)
+        if Update_Study_Design is True:
+            master_data_dict["study_design.csv"] = {"Data_Table": []}
+            #master_data_dict["study_design.csv"]["Data_Table"] = get_box_data_v2.get_study_design()
+            master_data_dict["study_design.csv"]["Data_Table"] = get_study_design(s3_client, bucket_name)
+        if Update_BSI_Tables is True:
+            master_data_dict = get_bsi_files(s3_client, bucket_name, sub_folder, master_data_dict)
+        if "secondary_confirmation_test_result.csv" in master_data_dict:
+            master_data_dict = update_secondary_confirm(master_data_dict, sql_column_df)
+
+        if "Add_Blinded_Results" in kwargs:
+            eval_data = []
+            if kwargs["Add_Blinded_Results"] is True:
+                success_msg.append("## The blinded result data has been updated")
+                #bucket = "nci-cbiit-seronet-submissions-passed"
+                bucket = bucket_name
+                key = "Serology_Data_Files/Reference_Panel_Files/Reference_Panel_Submissions/"
+                resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
+                for curr_file in resp["Contents"]:
+                    try:
+                        if "blinded_validation_panel_results_example" in curr_file["Key"]:  #testing file, ignore
+                            continue
+                        elif ".xlsx" in curr_file["Key"]:
+                            obj = s3_client.get_object(Bucket=bucket, Key= curr_file["Key"])
+                            x = pd.read_excel(obj['Body'].read(), engine='openpyxl') # 'Body' is a key word
+                            #x = pd_s3.get_df_from_keys(s3_client, bucket, curr_file["Key"], suffix="xlsx",
+                                                       #format="xlsx", na_filter=False, output_type="pandas")
+                        elif ".csv" in curr_file["Key"]:
+                            obj = s3_client.get_object(Bucket=bucket, Key= curr_file["Key"])
+                            x = pd.read_csv(obj['Body'])
+                            #x = pd_s3.get_df_from_keys(s3_client, bucket, curr_file["Key"], suffix="csv",
+                                                       #format="csv", na_filter=False, output_type="pandas")
+                        else:
+                            continue
+                        if len(eval_data) == 0:
+                            eval_data = x
+                        else:
+                            eval_data = pd.concat([eval_data, x])
+                    except Exception as e:
+                        error_msg.append(str(e))
+                        display_error_line(e)
+                eval_data.reset_index(inplace=True, drop=True)
+                sub_id = eval_data.loc[eval_data['Subaliquot_ID'].str.contains('FD|FS')]
+                bsi_id = eval_data.loc[~eval_data['Subaliquot_ID'].str.contains('FD|FS')]
+                sub_id.rename(columns={'Subaliquot_ID': "CGR_Aliquot_ID"}, inplace=True)
+
+                child_data = pd.read_sql(("SELECT Biorepository_ID, Subaliquot_ID, CGR_Aliquot_ID FROM BSI_Child_Aliquots"), conn)
+                eval_data = pd.concat([sub_id.merge(child_data), bsi_id.merge(child_data)])
+                master_data_dict = add_assay_to_dict(master_data_dict, "Blinded_Evaluation_Panels.csv", eval_data)
+
+        if "update_CDC_tables" in kwargs:
+            if kwargs["update_CDC_tables"] is True:
+                #bucket = "nci-cbiit-seronet-submissions-passed"
+                bucket = bucket_name
+                key = "Serology_Data_Files/CDC_Confirmation_Results/"
+                resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
+                CDC_data_IgG = pd.DataFrame()
+                CDC_data_IgM = pd.DataFrame()
+                for curr_file in resp["Contents"]:
+                    #  curr_file = get_recent_date(resp["Contents"])
+                    try:
+                        if ".xlsx" in curr_file["Key"]:
+                            file_date = curr_file["Key"][-13:-5]
+                            CDC_data_IgG = create_CDC_data(s3_client, bucket, curr_file, "IgG", CDC_data_IgG, file_date)
+                            CDC_data_IgM = create_CDC_data(s3_client, bucket, curr_file, "IgM", CDC_data_IgM, file_date)
+                    except Exception as e:
+                        error_msg.append(str(e))
+                        display_error_line(e)
+                CDC_Data = pd.concat([CDC_data_IgM, CDC_data_IgG])
+
+                CDC_Data["BSI_Parent_ID"] = [i[:7] + " 0001" for i in CDC_Data["Patient ID"].tolist()]
+                master_data_dict = add_assay_to_dict(master_data_dict, "CDC_Data.csv", CDC_Data)
+        if len(master_data_dict) > 0:
+            valid_files = [i for i in sql_table_dict if "_sql.csv" not in i]
+            valid_files = [i for i in valid_files if i in master_data_dict]
+            filtered_tables = [value for key, value in sql_table_dict.items() if key in valid_files]
+            tables_to_check = list(set([item for sublist in filtered_tables for item in sublist]))
+            #print(master_data_dict['assay_data.csv']['Data_Table'].keys())
+            # master_data_dict = {"submission.csv": master_data_dict["submission.csv"]}
+            if "covid_history.csv" in master_data_dict:
+                master_data_dict = check_decision_tree(master_data_dict)
+            error_length = len(error_msg)
+
+            add_tables_to_database(engine, conn, sql_table_dict, sql_column_df, master_data_dict, tables_to_check, [])
+
+            if len(error_msg) == error_length: #if the function does not generate new errors
+                conn.connection.commit()
+            else:
+                print("roll back")
+                conn.connection.rollback()
+
+
+
     except Exception as e:
         display_error_line(e)
-    finally:
-        '''
-        if study_type == "Refrence_Pannel":
-            populate_md5_table(pd, sql_tuple, study_type)
-        '''
-        close_connections(dbname, sql_tuple)
-    print("\nALl folders have been checked")
-    print("Closing Validation Program")
-    return error_message
+        error_msg.append(str(e))
+    # update_norm_cancer(conn, engine)
+    return sql_table_dict, all_submissions
 
 
-def close_connections(file_name, conn_tuple):
-    print("\n## Connection to " + file_name + " has been closed ##\n")
-    conn_tuple[2].close()    # conn
-    conn_tuple[1].dispose()  # engine
-
-
-
-
-#def check_bio_repo_tables(s3_client, s3_resource, study_type):
-#    print("\n## Checking Latest BSI report that was uploaded to S3 ##")
-#    start_time = time.time()
-#    dup_df = bio_repo_map(s3_client, s3_resource, study_type)
-#    if len(dup_df) == 0:
-#        print("## Biorepository_ID_map.xlsx file has been updated ## \n")
-#    else:
-##        print("## Duplicate IDs were found in the Biorepository.  Please Fix## \n")
-#    print("Biorepository Report took %.2f seconds" % (time.time() - start_time))
-
-
+def create_CDC_data(s3_client, bucket, curr_file, sheet, df, file_date):
+    obj = s3_client.get_object(Bucket=bucket, Key= curr_file["Key"])
+    x = pd.read_excel(obj['Body'].read(), sheet_name=sheet, engine='openpyxl')
+    #x = pd_s3.get_df_from_keys(s3_client, bucket, curr_file["Key"], suffix="xlsx",
+                               #format="xlsx", na_filter=False, output_type="pandas", sheet_name=sheet)
+    x["file_date"] = file_date
+    x["Measurand_Antibody"] = sheet
+    x["Patient ID"] = [i.replace(" 9002", "") for i in x["Patient ID"]]
+    df = pd.concat([df, x])
+    df.drop_duplicates(["Patient ID"], inplace=True, keep='last')
+    return df
 
 
 def display_error_line(ex):
@@ -367,338 +450,1046 @@ def display_error_line(ex):
     print(str({'type': type(ex).__name__, 'message': str(ex), 'trace': trace}))
 
 
+def get_recent_date(files):
+    curr_date = (files[0]["LastModified"]).replace(tzinfo=None)
+    index = -1
+    for file in files:
+        index = index + 1
+        if (file["LastModified"]).replace(tzinfo=None) > curr_date:
+            curr_date = (file["LastModified"]).replace(tzinfo=None)
+            curr_value = index
+    return files[curr_value]["Key"]
 
-def check_passed_file_validation(result_key, file_list, bucket, s3_client):
-    passing_msg = ("File is a valid Zipfile. No errors were found in submission. " +
-                   "Files are good to proceed to Data Validation")
-    result_message = check_result_message(result_key, file_list, passing_msg, bucket, s3_client)
-    return result_message
 
-
-def check_file(file, file_list):
-    for file_key in file_list:
-        if file in file_key['Key']:
-            return True
-    return False
-
-def check_result_message(result_key, file_list, passing_msg, bucket, s3_client):
-    result_message = "Result File Is Missing"
-    if not check_file("File_Validation_Results", file_list):
-        print("File-Validation has not been run on this submission\n")
+def get_kwarg_parms(update_str, kwargs):
+    if update_str in kwargs:
+        Update_Table = kwargs[update_str]
     else:
-        if check_file("Result_Message.txt", file_list):
-            try:
-                result_file = s3_client.get_object(Bucket=bucket, Key=result_key)
-                result_message = result_file['Body'].read().decode('utf-8')
-            except Exception as e:
-                display_error_line(e)
-                return result_message
-            if result_message != passing_msg:
-                print("Submitted File FAILED the File-Validation Process. With Error Message: " + result_message + "\n")
-            else:
-                result_message = "File Passed File-Validation"
-    return result_message
+        Update_Table = False
+    return Update_Table
 
 
-def populate_object(current_sub_object, list_of_files, Support_Files, study_type):
-    for file_key in list_of_files:
-        current_sub_object.get_data_tables(file_key, study_type)
-        file_name = os.path.basename(file_key)
-        if file_name not in ["study_design.csv"]:   # do not check columns for this file
-            current_sub_object.column_validation(file_name, Support_Files)
-    study_name = current_sub_object.get_submission_metadata(Support_Files)
-    return current_sub_object, study_name
+def check_decision_tree(master_data_dict):
+    data_table = master_data_dict["covid_history.csv"]["Data_Table"]
+    data_table.replace("No COVID Event Reported", "No COVID event reported", inplace=True)
+
+    no_covid_data = data_table.query("COVID_Status in ['No COVID event reported', 'No COVID data collected']")
+    pos_data = data_table[data_table["COVID_Status"].str.contains("Positive")]  # samples that contain at least 1 positive
+    neg_data = data_table[data_table["COVID_Status"].str.contains("Negative")]
+    neg_data = neg_data[~neg_data["COVID_Status"].str.contains("Positive")]     # samples that are all negative
+
+    no_covid_data = set_col_vals(no_covid_data, "N/A", "N/A", "N/A", 'Not Reported', 'N/A')
+    neg_data = set_col_vals(neg_data, "N/A", "N/A", "N/A", 0, 'N/A')
+
+    pos_data["SARS-CoV-2_Variant"] = pos_data["SARS-CoV-2_Variant"].replace("Unavailable", "Unknown")
+    pos_data["SARS-CoV-2_Variant"] = pos_data["SARS-CoV-2_Variant"].replace("N/A", "Unknown")
+
+    pos_yes_sys = pos_data.query("Symptomatic_COVID == 'Yes'")
+    pos_no_sys = pos_data.query("Symptomatic_COVID == 'No'")
+    pos_ukn_sys = pos_data.query("Symptomatic_COVID == 'Unknown'")
+    pos_no_sys = set_col_vals(pos_no_sys, True, True, "No", 1, 'N/A')       # value of true means keep same
+    pos_ukn_sys = set_col_vals(pos_ukn_sys, True, True, "Unknown", True, 'No symptoms reported')     # value of true means keep same
+
+    data_table_2 = pd.concat([pos_yes_sys, pos_no_sys, pos_ukn_sys, neg_data, no_covid_data])
+    master_data_dict["covid_history.csv"]["Data_Table"] = data_table_2
+    return master_data_dict
 
 
+def set_col_vals(df_data, breakthrough, variant, covid, disease, symptoms):
+    if breakthrough is not True:
+        df_data["Breakthrough_COVID"] = breakthrough
+    if variant is not True:
+        df_data["SARS-CoV-2_Variant"] = variant
+    if covid is not True:
+        df_data["Symptomatic_COVID"] = covid
+    if disease is not True:
+        df_data["Disease_Severity"] = disease
+    if symptoms is not True:
+        df_data["Symptoms"] = symptoms
+    return df_data
 
 
-def zero_pad_ids(curr_obj):
-    data_dict = curr_obj.Data_Object_Table
+def get_all_submissions(s3_client, bucket_name, sub_folder, cbc_name, cbc_id, all_submissions, cbc_code):
+    global error_msg
+    """ scans the buceket name and provides a list of all files paths found """
+    uni_submissions = []
+    Prefix=sub_folder + "/" + cbc_name
     try:
-        if "aliquot.csv" in data_dict:
-            z = data_dict["aliquot.csv"]["Data_Table"]["Aliquot_ID"].tolist()
-            z = [i[0:13] + "_0" + i[14] if i[-2] == '_' else i for i in z]
-            data_dict["aliquot.csv"]["Data_Table"]["Aliquot_ID"] = z
-        if "shipping_manifest.csv" in data_dict:
-            z = data_dict["shipping_manifest.csv"]["Data_Table"]["Current Label"].tolist()
-            for index in range(len(z)):
-                if len(z[index]) <= 16:   # valid aliquot length
-                    pass
-                elif z[index][15].isnumeric():
-                    z[index] = z[index][:16]
-                elif z[index][14].isnumeric():
-                    z[index] = z[index][:15]
-                else:
-                    print("unknown string")
-
-            z = [i[0:13] + "_0" + i[14] if i[-2] == '_' else i for i in z]
-            data_dict["shipping_manifest.csv"]["Data_Table"]["Current Label"] = z
+        key_list = s3_client.list_objects(Bucket=bucket_name, Prefix=sub_folder + "/" + cbc_name)
+        if 'Contents' in key_list:
+            key_list = key_list["Contents"]
+            key_list = [i["Key"] for i in key_list if ("UnZipped_Files" in i["Key"])]
+            file_parts = [os.path.split(i)[0] for i in key_list]
+            file_parts = [i for i in file_parts if "test/" not in i[0:5]]
+            file_parts = [i for i in file_parts if "Submissions_in_Review" not in i]
+            uni_submissions = list(set(file_parts))
+        else:
+            uni_submissions = []  # no submissions found for given cbc
     except Exception as e:
-        display_error_line(e)
-    curr_obj.Data_Object_Table = data_dict
-    return curr_obj
+        error_msg.append(str(e))
+        print("Erorr found")
+    finally:
+        cbc_code = cbc_code + [str(cbc_id)]*len(uni_submissions)
+        return all_submissions + uni_submissions, cbc_code
 
 
-def generate_rec_report(sql_tuple, s3_client, bucket):
-    print("\n Generating Requestion Excel Files for BSI")
-    start_time = time.time()
-    curr_file = "Serology_Data_Files/biorepository_id_map/Biorepository_ID_map.xlsx"
-    #parent_data = pd_s3.get_df_from_keys(s3_client, bucket, curr_file, suffix="xlsx", sheet_name="BSI_Parent_Aliquots", format="xlsx", na_filter=False, output_type="pandas")
-    obj = s3_client.get_object(Bucket=bucket, Key= curr_file["Key"])
-    parent_data = pd.read_excel(obj['Body'].read(), sheet_name="BSI_Parent_Aliquots", engine='openpyxl')
-    #child_data = pd_s3.get_df_from_keys(s3_client, bucket, curr_file, suffix="xlsx", sheet_name="BSI_Child_Aliquots", format="xlsx", na_filter=False, output_type="pandas")
-    child_data = pd.read_excel(obj['Body'].read(), sheet_name="BSI_Child_Aliquots", engine='openpyxl')
-    parent_data = parent_data.query("`Material Type` == 'SERUM'")
-
-    parent_data["Participant_ID"] = [i[:9] for i in parent_data["CBC_Biospecimen_Aliquot_ID"].tolist()]
-    z = parent_data['Participant_ID'].value_counts()
-    z = z.to_frame()
-    z.reset_index(inplace=True)
-    z.columns = ["Participant_ID", "Vial_Count"]
-
-    # single_ids = parent_data.merge(z.query('Vial_Count == 1'))
-    parent_data = parent_data.merge(z.query('Vial_Count > 1'))
-#    parent_data = parent_data.query("`Vial Status` in ['In']")
-
-    parent_data.sort_values(by="CBC_Biospecimen_Aliquot_ID", inplace=True)
-    parent_data.drop_duplicates("Participant_ID", keep="first", inplace=True)
-
-    child_data["Participant_ID"] = [i[:9] for i in child_data["CBC_Biospecimen_Aliquot_ID"].tolist()]
-    child_data.drop_duplicates("Participant_ID", keep="first", inplace=True)
-
-    z = parent_data.merge(child_data["Biorepository_ID"], on='Biorepository_ID',
-                          how="outer", indicator=True)
-    z = z.query("_merge == 'left_only'")
-    z["CBC_ID"] = [i[:2] for i in z["Participant_ID"].tolist()]
-
-    Mount_Sinai = z.query("CBC_ID == '14'")
-    Minnesota = z.query("CBC_ID == '27'")
-    Arizona = z.query("CBC_ID == '32'")
-    Feinstein = z.query("CBC_ID == '41'")
-    write_cgr_file(Mount_Sinai, "Mount_Sinai_to_CGR.xlsx", s3_client, bucket)
-    write_cgr_file(Minnesota, "UMN_to_CGR.xlsx", s3_client, bucket)
-    write_cgr_file(Arizona, "ASU_to_CGR.xlsx", s3_client, bucket)
-    write_cgr_file(Feinstein, "Feinstein_to_CGR.xlsx", s3_client, bucket)
-    print("Reports took %.2f seconds" % (time.time() - start_time))
+def get_cbc_id(conn, cbc_name):
+    cbc_table = pd.read_sql("Select * FROM CBC", conn)
+    cbc_table = cbc_table.query("CBC_Name == @cbc_name")
+    cbc_id = cbc_table["CBC_ID"].tolist()
+    return cbc_id[0]
 
 
-def write_cgr_file(df, file_name, s3_client, bucket):
-    df = df[~df["Vial Modifiers"].str.contains('Missing PCR Result')]
-    if len(df) > 0:
-        df.drop(["Participant_ID", "_merge", "CBC_ID", "Vial_Count"], axis=1, inplace=True)
-        #writer = pd.ExcelWriter(f"C:\\Python_Code\\Serology_Reports\\{file_name}", engine='xlsxwriter')
-        excel_buffer = df.to_excel(index=False, engine='xlsxwriter')
-        s3_client.put_object(Body=excel_buffer, Bucket=bucket, Key=os.path.join("Serology_Data_Files/biorepository_id_map/Serology_Reports/", file_name))
+def get_sql_info(conn, sql_table, sql_column_df):
+    col_names = sql_column_df.query("Table_Name==@sql_table")
+    prim_key = col_names.query("Primary_Key == 'True' and Var_Type not in ['INTEGER', 'FLOAT']")
+    sql_df = pd.read_sql(f"Select * FROM {sql_table}", conn)
+    sql_df = sql_timestamp(sql_df, sql_column_df)
+    primary_keys = prim_key["Column_Name"].tolist()
+    return primary_keys, col_names, sql_df
 
 
-def check_serology_submissions(s3_client, bucket, assay_data, assay_target, success_msg, error_msg, study_type):
-    key = "Serology_Data_Files/serology_confirmation_test_result/"
-    serology_code = '12'
-    resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
-    file_name = "serology_confirmation_test_results.csv"
-    for curr_serology in resp["Contents"]:
-        if ("Test_Results_Passed" in curr_serology["Key"]) or ("Test_Results_Failed" in curr_serology["Key"]):
-            pass
-        elif ".xlsx" in curr_serology["Key"]:
-            current_sub_object = Submission_Object("Serology")
-            #serology_data = pd_s3.get_df_from_keys(s3_client, bucket, prefix=curr_serology["Key"], suffix="xlsx", format="xlsx", na_filter=False, output_type="pandas")
-            obj = s3_client.get_object(Bucket=bucket, Key= curr_serology["Key"])
-            serology_data = pd.read_excel(obj['Body'].read(), engine='openpyxl')
-            data_table, drop_list = current_sub_object.validate_serology(file_name, serology_data,
-                                                                         assay_data, assay_target, serology_code)
-            current_sub_object = vald_rules.Validation_Rules(re, datetime, current_sub_object, data_table,
-                                                  file_name, serology_code, drop_list, study_type)
-            error_list = current_sub_object.Error_list
-            error_count = len(error_list)
-            if error_count == 0:
-                print("\n## Serology File has No Errors, Submission is Valid\n")
-                success_msg.append("\n## Serology File has No Errors, Submission is Valid\n")
+def clean_tube_names(curr_table):
+    curr_cols = curr_table.columns.tolist()
+    curr_cols = [i.replace("Collection_Tube", "Tube") for i in curr_cols]
+    curr_cols = [i.replace("Aliquot_Tube", "Tube") for i in curr_cols]
+    # curr_cols = [i.replace("Tube_Type_Expiration_", "Tube_Lot_Expiration_") for i in curr_cols]
+    curr_cols = [i.replace("Biospecimen_Company", "Biospecimen_Collection_Company") for i in curr_cols]
+    curr_table.columns = curr_cols
+    curr_table["Tube_Type_Lot_Number"] = [str(i) for i in curr_table["Tube_Type_Lot_Number"]]
+    curr_table["Tube_Type_Catalog_Number"] = [str(i) for i in curr_table["Tube_Type_Catalog_Number"]]
+    return curr_table
+
+
+def get_upload_info(s3_client, bucket_name, curr_sub, sub_folder):
+    # read the submission.csv and return info
+    file_sep = os.path.sep
+    if sub_folder in curr_sub[1][0]:
+        sub_obj = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=curr_sub[1][0])
+    else:
+        sub_obj = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=sub_folder + file_sep + curr_sub[1][0])
+    try:
+        upload_date = sub_obj["Contents"][0]["LastModified"]
+        upload_date = upload_date.replace(tzinfo=None)  # removes timezone element from aws
+    except Exception:
+        upload_date = 0
+    submission_file = [i["Key"] for i in sub_obj["Contents"] if "submission.csv" in i["Key"]]
+    submission_file = submission_file[0]
+
+    obj = s3_client.get_object(Bucket=bucket_name, Key = submission_file)
+    curr_table = pd.read_csv(obj['Body'])
+    #curr_table = pd_s3.get_df_from_keys(s3_client, bucket_name, submission_file, suffix="csv", format="csv", na_filter=False, output_type="pandas")
+    intent = curr_table.iloc[3][1]
+    sub_name = curr_table.columns[1]
+    return upload_date, intent, sub_name
+
+
+def get_tables_to_load(s3_client, bucket, folders, curr_sub, conn, sub_name, index, upload_date, intent, master_dict, data_release):
+    """Takes current submission and gets all csv files into pandas tables """
+    files = [i["Key"] for i in folders if curr_sub[1][0] in i["Key"]]
+    files = [i for i in files if ".csv" in i]
+    data_dict = get_data_dict(s3_client, bucket, files, conn, curr_sub, sub_name, index, upload_date, intent, data_release)
+
+    if len(data_dict) > 0:
+        master_dict = combine_dictionaries(master_dict, data_dict)
+    return master_dict
+
+
+def get_data_dict(s3_client, bucket, files, conn, curr_sub, sub_name, index, upload_date, intent, data_release):
+    data_dict = {}
+    global error_msg
+    for curr_file in files:
+        split_path = os.path.split(curr_file)
+        try:
+            if "study_design" in split_path[1]:
+                continue
+            elif "submission" in split_path[1]:
+                curr_table = populate_submission(conn, curr_sub, sub_name, index, upload_date, intent, data_dict)
             else:
-                print(f"\n## Serology File has {error_count} Errors, Check submission\n")
-                error_msg.append(f"\n## Serology File has {error_count} Errors, Check submission\n")
-            return success_msg, error_msg
+                obj = s3_client.get_object(Bucket=bucket, Key = curr_file)
+                curr_table = pd.read_csv(obj['Body'])
+                #curr_table = pd_s3.get_df_from_keys(s3_client, bucket, split_path[0], suffix=split_path[1],
+                                                    #format="csv", na_filter=False, output_type="pandas")
+                if "Age" in curr_table.columns:
+                    err_idx = curr_table.query("Research_Participant_ID in ['14_M95508'] and Age in ['93', 93] or " +
+                                               "Research_Participant_ID in ['14_M80341'] and Age in ['96', 96]")
+                    curr_table["Data_Release_Version"] = data_release
+                    if len(err_idx) > 0:
+                        curr_table = curr_table.drop(err_idx.index)
+                curr_table["Submission_Index"] = str(index)
+            curr_table = curr_table.loc[~(curr_table == '').all(axis=1)]
+            curr_table.rename(columns={"Cohort": "CBC_Classification"})
+        except Exception as e:
+            error_msg.append(str(e))
+            display_error_line(e)
+        curr_table = clean_up_tables(curr_table)
+        curr_table["Submission_CBC"] = curr_sub[1][1]
+        if "secondary_confirmation" in split_path[1]:
+            data_dict["secondary_confirmation_test_result.csv"] = {"Data_Table": []}
+            data_dict["secondary_confirmation_test_result.csv"]["Data_Table"] = curr_table
+        else:
+            data_dict[split_path[1]] = {"Data_Table": []}
+            #  curr_table.dropna(inplace=True)
+            data_dict[split_path[1]]["Data_Table"] = curr_table
+    return data_dict
 
 
-def populate_md5_table(pd, sql_tuple, study_type):
-    convert_table = pd.read_sql(sd.text("SELECT * FROM Deidentifed_Conversion_Table"), sql_tuple[2])
-    if study_type == "Refrence_Pannel":
-        demo_ids = pd.read_sql(sd.text("SELECT Research_Participant_ID FROM Participant"), sql_tuple[2])
-        bio_ids = pd.read_sql(sd.text("SELECT Biospecimen_ID FROM Biospecimen"), sql_tuple[2])
-        aliquot_ids = pd.read_sql(sd.text("SELECT Aliquot_ID FROM Aliquot"), sql_tuple[2])
-    elif study_type == "Vaccine_Response":
-        pass
-    all_ids = set_tables(demo_ids, "Participant_ID")
-    all_ids = pd.concat([all_ids, set_tables(bio_ids, "Biospecimen_ID")])
-    all_ids = pd.concat([all_ids, set_tables(aliquot_ids, "Aliquot_ID")])
-    all_ids = all_ids.merge(convert_table, how="left", indicator=True)
-    all_ids = all_ids.query("_merge == 'left_only'")
-    if len(all_ids) > 0:  # new ids need to be added
-        all_ids.drop("_merge", inplace=True, axis=1)
-        all_ids["MD5_Value"] = [hashlib.md5(i.encode('utf-8')).hexdigest() for i in all_ids["ID_Value"].tolist()]
-        all_ids.to_sql(name="Deidentifed_Conversion_Table", con=sql_tuple[2], if_exists="append", index=False)
+def update_obesity_values(master_data_dict):
+    global error_msg
+    baseline = master_data_dict["baseline.csv"]["Data_Table"]
+    try:
+        baseline["BMI"] = baseline["BMI"].replace("Not Reported", -1e9)
+        baseline["BMI"] = baseline["BMI"].replace("N/A", -1e9)
+        baseline["BMI"] = [float(i) for i in baseline["BMI"]]
+
+        baseline.loc[baseline.query("BMI < 0").index, "Obesity"] = "Not Reported"
+        baseline.loc[baseline.query("BMI < 18.5 and BMI > 0").index, "Obesity"] = "Underweight"
+        baseline.loc[baseline.query("BMI >= 18.5 and BMI <= 24.9").index, "Obesity"] = "Normal Weight"
+        baseline.loc[baseline.query("BMI >= 25.0 and BMI <= 29.9").index, "Obesity"] = "Overweight"
+        baseline.loc[baseline.query("BMI >= 30.0 and BMI <= 34.9").index, "Obesity"] = "Class 1 Obesity"
+        baseline.loc[baseline.query("BMI >= 35.0 and BMI <= 39.9").index, "Obesity"] = "Class 2 Obesity"
+        baseline.loc[baseline.query("BMI >= 40").index, "Obesity"] = "Class 3 Obesity"
+
+        baseline["BMI"] = baseline["BMI"].replace(-1e9, np.nan)
+    except Exception as e:
+        error_msg.append(str(e))
+        display_error_line(e)
+
+    master_data_dict["baseline.csv"]["Data_Table"] = baseline
+    return master_data_dict
 
 
-def set_tables(df, id_type):
-    df.columns = ["ID_Value"]
-    df["ID_Type"] = id_type
-    df = df[["ID_Type", "ID_Value"]]
-    return df
+def add_error_flags(curr_table, err_idx):
+    if len(err_idx) > 0:
+        curr_table.loc[err_idx.index, "Error_Flag"] = "Yes"
+    return curr_table
 
 
+def get_master_dict(master_data_dict, master_data_update, sql_column_df, sql_table_dict):
+    global error_msg
+    for key in master_data_dict.keys():
+        try:
+            table = sql_table_dict[key]
+            primary_key = sql_column_df.query(f"Table_Name == {table} and Primary_Key == 'True'")["Column_Name"].tolist()
+        except Exception:
+            primary_key = "Biospecimen_ID"
+        if key in ['shipping_manifest.csv']:
+            primary_key = 'Current Label'
+        if "Test_Result" in primary_key:
+            primary_key[primary_key.index("Test_Result")] = 'SARS_CoV_2_PCR_Test_Result'
+
+        if isinstance(primary_key, str):
+            primary_key = [primary_key]
+        if "Biospecimens_Collected" in primary_key: 
+            primary_key.remove("Biospecimens_Collected")
+        if key in master_data_update.keys():
+            try:
+                x = pd.concat([master_data_dict[key]["Data_Table"], master_data_update[key]["Data_Table"]])
+                x.reset_index(inplace=True, drop=True)
+                x = correct_var_types(x, sql_column_df, table)
+                if "Visit_Info_ID" in primary_key and "Visit_Info_ID" not in x.columns:
+                    x, primary_key = add_visit_info(x, key, primary_key)
+                if key not in ["submission.csv"]:
+                    primary_key = [i for i in primary_key if i in x.columns]
+                    primary_key = list(set(primary_key))
+                    if len(primary_key) > 0:
+                        x["Submission_Index"] = [int(i) for i in x["Submission_Index"]]
+                        x = x.sort_values(primary_key + ["Submission_Index"])
+                        if key in ['shipping_manifest.csv']:
+                            x = x.drop_duplicates(primary_key, keep='last')
+                        else:
+                            first_data = x.drop_duplicates(primary_key, keep='first')
+                            last_data = x.drop_duplicates(primary_key, keep='last')
+                            last_data.drop("Submission_Index", axis=1, inplace=True)
+                            x = last_data.merge(first_data[primary_key + ["Submission_Index"]])
+                if "Cohort" in x.columns:
+                    x = x.query("Cohort not in ('nan')")
+                master_data_dict[key]["Data_Table"] = x
+            except Exception as e:
+                error_msg.append(str(e))
+                display_error_line(e)
+
+    for key in master_data_update.keys():  # key only in update
+        if key not in master_data_dict.keys():
+            master_data_dict[key] = master_data_update[key]
+
+    return master_data_dict
 
 
-
-def get_assay_data(s3_client, data_type, bucket_name):
-    assay_dir = "CBC_Folders/"
-    resp = s3_client.list_objects(Bucket=bucket_name, Prefix=assay_dir)
-    file_list = resp['Contents']
-    #print(file_list["Contents"][1])
-    assay_paths = []
-    path_dir = pd.DataFrame(columns=["Dir_Path", "File_Name", "Date_Created", "Date_Modified"])
-    for file in file_list:
-        if (file['Key'].endswith(".xlsx")) and ("20210402" not in file['Key']):
-            file_path = file['Key']
-            assay_paths.append(file_path)
-            created = file['LastModified']
-            modified =  file['LastModified']
-            path_dir.loc[len(path_dir.index)] = [os.path.dirname(file['Key']), os.path.basename(file['Key']), created, modified]
-
-    if data_type == "CBC_Data":
-        all_assay_data = pd.DataFrame()
-        all_target_data = pd.DataFrame()
-        all_qc_data = pd.DataFrame()
-        converion_file = pd.DataFrame()
-
-        uni_path = list(set(path_dir["Dir_Path"]))
-        for curr_path in uni_path:
-            curr_folder = path_dir.query("Dir_Path == @curr_path")
-            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: 'assay' in x and "assay_qc" not in x
-                                                                    and "assay_target" not in x)]
-            all_assay_data = populate_df(all_assay_data, assay_file, bucket_name, s3_client)
-
-            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: "assay_qc" in x)]
-            all_qc_data = populate_df(all_qc_data, assay_file, bucket_name, s3_client)
-
-            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: "assay_target_antigen" in x or
-                                                                    "assay_target" in x)]
-            all_target_data = populate_df(all_target_data, assay_file, bucket_name, s3_client)
-
-            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: "Assay_Target_Organism_Conversion.xlsx" in x)]
-            converion_file = populate_df(converion_file, assay_file, bucket_name, s3_client)
-
-        if len(all_assay_data) > 0:
-            all_assay_data = box_clean_up_tables(all_assay_data, '[0-9]{2}[_]{1}[0-9]{3}$')
-        if len(all_target_data) > 0:
-            all_target_data = box_clean_up_tables(all_target_data, '[0-9]{2}[_]{1}[0-9]{3}$')
-        if len(all_qc_data) > 0:
-            all_qc_data = box_clean_up_tables(all_qc_data, '[0-9]{2}[_]{1}[0-9]{3}$')
-
-        return all_assay_data, all_target_data, all_qc_data, converion_file
-    elif data_type == "Validation":
-        #print("x")
-        assay_file = assay_dir + "Seronet_Reference_Panels/"+ "validation_panel_assays.xlsx"
-        #curr_data = pd.read_excel(assay_file, na_filter=False, engine='openpyxl')
-        obj = s3_client.get_object(Bucket=bucket_name, Key=assay_file)
-        curr_data = pd.read_excel(obj['Body'].read(), na_filter=False, engine='openpyxl')
-        return curr_data
+def add_visit_info(df, curr_file, primary_key):
+    if curr_file == "baseline.csv":
+        df['Type_Of_Visit'] = "Baseline"
+        df['Visit_Number'] = "1"
+        df['Unscheduled_Visit'] = "No"
+        
+        #df['Type_Of_Visit'] = "MISPA"
+        #df['Visit_Number'] = "-1"
+        #df['Unscheduled_Visit'] = "Yes"
+    elif curr_file == "follow_up.csv":
+        df['Type_Of_Visit'] = "Follow_up"
+        base = df.query("Baseline_Visit == 'Yes'")
+        if len(base) > 0:
+            df.loc[base.index, "Type_Of_Visit"] = "Baseline"
+    else:
+        primary_key.append("Research_Participant_ID")
+        primary_key.append("Cohort")
+        primary_key.append("Visit_Number")
+        return df, primary_key
+    
+    list_of_visits = list(range(1,20)) + [str(i) for i in list(range(1,20))] + [-1, '-1']
+    df["Visit_Info_ID"] = (df["Research_Participant_ID"] + " : " + [i[0] for i in df["Type_Of_Visit"]] +
+                           ["%02d" % (int(i),) if i in list_of_visits else i for i in df['Visit_Number']])
+    return df, primary_key
 
 
-def populate_df(curr_assay, assay_file, bucket_name, s3_client):
-    if len(assay_file):
-        curr_data = assay_file[assay_file["Date_Modified"] == max(assay_file["Date_Modified"])]
-        file_path = os.path.join(curr_data["Dir_Path"].tolist()[0], curr_data["File_Name"].tolist()[0])
-        #curr_data = pd.read_excel(file_path, na_filter=False, engine='openpyxl')
-        obj = s3_client.get_object(Bucket=bucket_name, Key=file_path)
-        curr_data = pd.read_excel(obj['Body'].read(), na_filter=False, engine='openpyxl')
-        curr_assay = pd.concat([curr_assay, curr_data])
-    return curr_assay
+def convert_data_type(v, var_type):
+    if isinstance(v, datetime.datetime) and var_type.lower() == "datetime":
+        return v
+    if isinstance(v, datetime.date) and var_type.lower() == "date":
+        return v
+    if isinstance(v, datetime.time) and var_type.lower() == "time":
+        return v
+
+    if v == "Baseline(1)":
+        v = 1
+
+    if str(v).find('_') > 0:
+        return v
+    try:
+        float(v)        # value is a number
+        if (float(v) * 10) % 10 == 0 or (float(v) * 10) % 10 == 0.0:
+            return int(float(v))
+        else:
+            return round(float(v), 5)
+    except ValueError:
+        try:
+            if var_type.lower() == "datetime":
+                return parse(v)
+            elif var_type.lower() == "date":
+                return parse(v).date()
+        except ValueError:
+            return v
 
 
-def box_clean_up_tables(curr_table, ptrn_str):
-    curr_table = curr_table[curr_table["Assay_ID"].apply(lambda x: re.compile(ptrn_str).match(str(x)) is not None)]
-    curr_table = curr_table.dropna(axis=0, how="all", subset=None)
+def correct_var_types(data_table, sql_column_df, curr_table):
+    col_names = data_table.columns
+    for curr_col in col_names:
+        if "Derived_Result" in data_table.columns:
+            data_table = updated_derived(data_table)
+        z = sql_column_df.query("Column_Name == @curr_col and Table_Name == @curr_table").drop_duplicates("Column_Name")
+        if len(z) > 0:
+            var_type = z.iloc[0]["Var_Type"]
+        else:
+            var_type = "VARCHAR(255)"
+        if var_type in ['INTEGER', 'FLOAT', 'DOUBLE']:
+            data_table[curr_col].replace("N/A", np.nan, inplace=True)
+        if curr_col in ["Age", "Storage_Time_in_Mr_Frosty", "Biospecimen_Collection_to_Test_Duration", "BMI", "Derived_Result"]:
+            data_table = round_data(data_table, curr_col, 1)
+        if curr_col in ["Derived_Result"]:
+            data_table = round_data(data_table, curr_col, 3)
+        elif curr_col in ["Sample_Dilution"] and "Subaliquot_ID" in data_table.columns:  # special formating for reference panel testing
+            data_table[curr_col].replace("none", "1", inplace=True)   #no dilution is same as 1:1 dilution
+            data_table[curr_col] = [str(f"{Decimal(i):.2E}") for i in data_table[curr_col]]
+        elif "varchar" in var_type.lower():
+            data_table[curr_col] = [str(i) for i in data_table[curr_col]]
+        else:
+            data_table[curr_col] = [convert_data_type(c, var_type) for c in data_table[curr_col]]
+    return data_table
+
+
+def round_data(data_table, test_col, round_unit):
+    for x in data_table.index:
+        try:
+            if data_table.loc[x, test_col] == "90+":
+                data_table.loc[x, test_col] = 90
+            curr_data = round(float(data_table.loc[x, test_col]), round_unit)
+            if (curr_data * 10) % 10 == 0.0:
+                curr_data = int(curr_data)
+            data_table.loc[x, test_col] = float(curr_data)
+        except Exception:
+            data_table.loc[x, test_col] = str(data_table.loc[x, test_col])
+    return data_table
+
+
+def clean_up_tables(curr_table):
+    if "Submission_Index" in curr_table.columns:
+        x = curr_table.drop("Submission_Index", axis=1)
+        x.replace("", float("NaN"), inplace=True)
+        #x.dropna(axis=0, how="all", thresh=None, subset=None, inplace=True)
+        x.dropna(axis=0, how="all", subset=None, inplace=True)
+        z = curr_table["Submission_Index"].to_frame()
+        curr_table = x.merge(z, left_index=True, right_index=True)
+    else:
+        curr_table.dropna(axis=0, how="all", thresh=None, subset=None, inplace=True)
     if len(curr_table) > 0:
         missing_logic = curr_table.eq(curr_table.iloc[:, 0], axis=0).all(axis=1)
         curr_table = curr_table[[i is not True for i in missing_logic]]
         curr_table = curr_table.loc[:, ~curr_table .columns.str.startswith('Unnamed')]
-        curr_table = curr_table.replace('–', '-')
-        curr_table.columns = [i.replace("Assay_Target_Antigen", "Assay_Target") for i in curr_table.columns]
-        curr_table.columns = [i.replace("lavage", "Lavage") for i in curr_table.columns]
+        for iterC in curr_table.columns:
+            try:
+                curr_table[iterC] = curr_table[iterC].apply(lambda x: x.replace('–', '-'))
+            except Exception:
+                pass
+    if "Comments" in curr_table.columns:
+        curr_table = curr_table.query("Comments not in ['Invalid data entry; do not include']")
     return curr_table
 
 
+def sql_timestamp(sql_df, sql_column_df):
+    new_list = sql_column_df.query("Var_Type == 'TIME'")
+    for i in new_list["Column_Name"].tolist():
+        if i in sql_df.columns.tolist():
+            curr_col = sql_df[i]
+            for iterC in curr_col.index:
+                if (sql_df[i][iterC] == sql_df[i][iterC]) and (isinstance(sql_df[i][iterC], pd.Timedelta)):
+                    hours = int((sql_df[i][iterC].seconds/60)/60)
+                    minutes = int((sql_df[i][iterC].seconds % 3600)/60)
+                    seconds = sql_df[i][iterC].seconds - (hours*3600 + minutes*60)
+                    sql_df[i][iterC] = datetime.time(hours, minutes, seconds)
+    return sql_df
 
-########################
 
-def get_template_data(s3_client, study_name, bucket):
-    if study_name == 'Refrence_Pannel':
-        #template_dir = (box_dir + file_sep + "CBC Data Submission Documents" + file_sep + "Reference Panel Data Submission Templates")
-        template_df = get_template_columns(s3_client, bucket, template_dir)
-        dbname = "seronetdb-Validated"  # name of the SQL database where data is saved
-    elif study_name == 'Vaccine_Response':
-        #template_dir = (box_dir + file_sep + "CBC Data Submission Documents" + file_sep + "Vaccine_Response_Study_Templates" + file_sep + "Data_Submission_Templates")
-        template_dir = "Data_Submissions_Need_To_Validate/Vaccine_Response_Study_Templates/"
-        template_df = get_template_columns(s3_client, bucket, template_dir)
-        dbname = "seronetdb-Vaccine_Response"  # name of the SQL database where data is saved
+def populate_submission(conn, curr_sub, sub_name, index, upload_date, intent, data_dict):
+    x_name = pathlib.PurePath(curr_sub[1][0])
+    part_list = x_name.parts
+    try:
+        curr_time = datetime.datetime.strptime(part_list[2], "%H-%M-%S-%m-%d-%Y")
+    except Exception:  # time stamp was corrected
+        curr_time = datetime.datetime.strptime(part_list[2], "%Y-%m-%d-%H-%M-%S")
+    cbc_id = get_cbc_id(conn, sub_name)
+    file_name = re.sub("submission_[0-9]{3}_", "", part_list[3])
+    sql_df = pd.DataFrame([[index, cbc_id, curr_time, sub_name, file_name, curr_sub[1][0], upload_date, intent]],
+                          columns=["Submission_Index", "Submission_CBC_ID", "Submission_Time",
+                                   "Submission_CBC_Name", "Submission_File_Name", "Submission_S3_Path",
+                                   "Date_Submission_Validated", "Submission_Intent"])
+    return sql_df
+
+
+def add_submission_data(data_dict, conn, csv_sheet):
+    sub_data = data_dict["submission.csv"]["Data_Table"]
+    curr_table = data_dict[csv_sheet]["Data_Table"]
+    curr_table["Submission_CBC"] = get_cbc_id(conn, sub_data.columns[1])
+    return curr_table
+
+
+def combine_dictionaries(master_data_dict, data_dict):
+    global error_msg
+    for curr_file in data_dict:
+        try:
+            if curr_file not in master_data_dict:
+                master_data_dict[curr_file] = {"Data_Table": data_dict[curr_file]["Data_Table"]}
+            else:
+                x = pd.concat([master_data_dict[curr_file]["Data_Table"], data_dict[curr_file]["Data_Table"]],
+                              axis=0, ignore_index=True).reset_index(drop=True)
+                master_data_dict[curr_file]["Data_Table"] = x
+        except Exception as e:
+            error_msg.append(str(e))
+            display_error_line(e)
+    return master_data_dict
+
+
+def fix_aliquot_ids(master_data_dict, keep_order, sql_column_df):
+    if "aliquot.csv" in master_data_dict:
+        z = master_data_dict["aliquot.csv"]["Data_Table"]["Aliquot_ID"].tolist()
+        master_data_dict["aliquot.csv"]["Data_Table"]["Aliquot_ID"] = zero_pad_ids(z)
+        z = master_data_dict["aliquot.csv"]["Data_Table"]["Aliquot_Volume"].tolist()
+        z = [(i.replace("N/A", "0")) if isinstance(i, str) else i for i in z]
+        master_data_dict["aliquot.csv"]["Data_Table"]["Aliquot_Volume"] = z
+        z = master_data_dict["aliquot.csv"]["Data_Table"]
+        z.sort_values("Submission_Index", axis=0, ascending=True, inplace=True)
+        #z.drop_duplicates("Aliquot_ID", keep=keep_order, inplace=True)
+        master_data_dict["aliquot.csv"]["Data_Table"] = correct_var_types(z, sql_column_df, "Aliquot")
+    if "shipping_manifest.csv" in master_data_dict:
+        z = master_data_dict["shipping_manifest.csv"]["Data_Table"]
+        z['Current Label'] = z['Current Label'].fillna(value="0")
+        master_data_dict["shipping_manifest.csv"]["Data_Table"] = z.query("`Current Label` not in ['0']")
+
+        z = master_data_dict["shipping_manifest.csv"]["Data_Table"]["Current Label"].tolist()
+        master_data_dict["shipping_manifest.csv"]["Data_Table"]["Current Label"] = zero_pad_ids(z)
+        z = master_data_dict["shipping_manifest.csv"]["Data_Table"]["Volume"].tolist()
+        z = [(i.replace("N/A", "0")) if isinstance(i, str) else i for i in z]
+        master_data_dict["shipping_manifest.csv"]["Data_Table"]["Volume"] = z
+        z = master_data_dict["shipping_manifest.csv"]["Data_Table"]
+        z.sort_values("Submission_Index", axis=0, ascending=True, inplace=True)
+        #z.drop_duplicates("Current Label", keep=keep_order, inplace=True)
+        master_data_dict["shipping_manifest.csv"]["Data_Table"] = correct_var_types(z, sql_column_df, "Shipping_Manifest")
+    return master_data_dict
+
+
+def zero_pad_ids(data_list):
+    global error_msg
+    try:
+        digits = [len(i[14:16]) for i in data_list]
+        for i in enumerate(digits):
+            if i[1] == 1:
+                if data_list[i[0]][14:15].isdigit():
+                    data_list[i[0]] = data_list[i[0]][:15]
+            elif i[1] == 2:
+                if data_list[i[0]][14:16].isdigit():
+                    data_list[i[0]] = data_list[i[0]][:16]
+                elif data_list[i[0]][14:15].isdigit():
+                    data_list[i[0]] = data_list[i[0]][:15]
+
+        data_list = [i[0:13] + "_0" + i[14] if i[-2] == '_' else i for i in data_list]
+    except Exception as e:
+        error_msg.append(str(e))
+        display_error_line(e)
+    finally:
+        return data_list
+
+
+def upload_assay_data(data_dict, bucket_name, s3_client):
+    global success_msg
+    #  populate the assay data tables which are independant from submissions
+    #assay_data, assay_target, all_qc_data, converion_file = get_box_data_v2.get_assay_data("CBC_Data")
+    assay_data, assay_target, all_qc_data, converion_file = get_assay_data(s3_client, "CBC_Data", bucket_name)
+    all_qc_data.replace("", "No Data Provided", inplace=True)
+    all_qc_data.replace(np.nan, "No Data Provided", inplace=True)
+    all_qc_data["Comments"] = all_qc_data["Comments"].replace("No Data Provided", "")
+
+    #if len(assay_data) > 0 and len(all_qc_data) > 0 and len(assay_target) > 0 and len(converion_file) > 0:
+    assay_data["Calibration_Type"] = assay_data["Calibration_Type"].replace("", "No Data Provided")
+    assay_data["Calibration_Type"] = assay_data["Calibration_Type"].replace("N/A", "No Data Provided")
+
+    data_dict = add_assay_to_dict(data_dict, "assay_data.csv", assay_data)
+    data_dict = add_assay_to_dict(data_dict, "assay_target.csv", assay_target)
+    data_dict = add_assay_to_dict(data_dict, "assay_qc.csv", all_qc_data)
+    data_dict = add_assay_to_dict(data_dict, "assay_conversion.csv", converion_file)
+
+    validation_panel_assays = get_assay_data("Validation")
+    data_dict = add_assay_to_dict(data_dict, "validation_assay_data.csv", validation_panel_assays)
+
+    print("## The assay data has been uploaded")
+    success_msg.append("## The assay data has been uploaded")
+
+
+    # validation_panel_assays = get_box_data.get_assay_data("Validation")
+    # data_dict = add_assay_to_dict(data_dict, "validation_assay_data.csv", validation_panel_assays)
+    return data_dict
+
+
+def add_assay_to_dict(data_dict, csv_file, data_table):
+    data_table.rename(columns={"Target_Organism": "Assay_Target_Organism"}, inplace=True)
+    data_dict[csv_file] = {"Data_Table": []}
+    data_dict[csv_file]["Data_Table"] = data_table
+    return data_dict
+
+
+def add_tables_to_database(engine, conn, sql_table_dict, sql_column_df, master_data_dict, tables_to_check, done_tables):
+    global error_msg
+    global success_msg
+    not_done = []
+    key_count = pd.crosstab(sql_column_df["Table_Name"], sql_column_df["Foreign_Key_Count"])
+    key_count.reset_index(inplace=True)
+    key_count = key_count.query("Table_Name not in @done_tables")
+    if len(key_count) == 0:
+        return
+
+    for curr_table in key_count["Table_Name"].tolist():
+        if curr_table in tables_to_check:
+            check_foreign = key_count.query("Table_Name == @curr_table and 1.0 > 0")
+            if len(check_foreign) > 0:
+                foreign_table = sql_column_df.query("Table_Name == @curr_table and Foreign_Key_Table not in ['', 'None']")["Foreign_Key_Table"].tolist()
+                check = all(item in done_tables for item in foreign_table)
+                if check is False:
+                    not_done.append(curr_table)
+                    continue    # dependent tables not checked yet
+
+        done_tables.append(curr_table)
+        if curr_table not in tables_to_check:
+            continue
+        y = sql_column_df.query("Table_Name == @curr_table")
+        y = y.query("Autoincrement != True")
+        sql_df = pd.read_sql((f"Select * from {curr_table}"), conn)
+        sql_df = sql_df[y["Column_Name"].tolist()]
+        # sql_df = sql_df.astype(str)
+        sql_df.replace("No Data", "NULL", inplace=True)  # if no data in sql this is wrong, used to correct
+        sql_df.fillna("No Data", inplace=True)  # replace NULL values from sql with "No Data" for merge purposes
+
+        num_cols = sql_column_df.query("Var_Type in ('INTEGER', 'INTERGER', 'FLOAT', 'DOUBLE')")["Column_Name"]
+        num_cols = list(set(num_cols))
+        char_cols = sql_column_df[sql_column_df['Var_Type'].str.contains("CHAR")]["Column_Name"]
+        char_cols = list(set(char_cols))
+
+        csv_file = [key for key, value in sql_table_dict.items() if curr_table in value]
+        output_file = pd.DataFrame(columns=y["Column_Name"].tolist())
+        if 'Sunday_Prior_To_First_Visit' in output_file.columns:
+            output_file.drop("Sunday_Prior_To_First_Visit", inplace=True, axis=1)
+        processing_file = []
+        processing_data = []
+        if len(csv_file) == 0:
+            continue
+        else:
+            for curr_file in csv_file:
+                if curr_file in master_data_dict:
+                    x = copy.copy(master_data_dict[curr_file]["Data_Table"])
+                    if "PCR_Test_Date_Duration_From_Index" in x.columns:
+                        z = x[["PCR_Test_Date_Duration_From_Index", "Rapid_Antigen_Test_Date_Duration_From_Index", "Antibody_Test_Date_Duration_From_Index"]]
+                        z = correct_var_types(z, sql_column_df, curr_table)
+                        z = z.mean(axis=1, numeric_only=True)
+                        x['Average_Duration_Of_Test'] = z.fillna("NAN")
+                else:
+                    continue
+                x.rename(columns={"Comments": curr_table + "_Comments"}, inplace=True)
+                if curr_table == "Tube":
+                    x = clean_tube_names(x)
+                    if curr_file == "aliquot.csv":
+                        x["Tube_Used_For"] = "Aliquot"
+                    elif curr_file == "biospecimen.csv":
+                        x["Tube_Used_For"] = "Biospecimen_Collection"
+                if curr_table == "Assay_Bio_Target":
+                    x = get_bio_target(x, conn)
+                try:
+                    x.replace({np.nan: 'N/A', 'nan': "N/A", '': "N/A", True: '1', False: '0'}, inplace=True)
+                    x = x.astype(str)
+                    if curr_file in ["equipment.csv", "consumable.csv", "reagent.csv"]:
+                        processing_data = copy.copy(x)
+                    x = get_col_names(x, y, conn, curr_table, curr_file, sql_column_df)
+                    '''
+                    if curr_table == "Tube":
+                        csv_buffer = x.to_csv(index=False).encode()
+                        s3_client = boto3.client('s3')
+                        s3_client.put_object(Body=csv_buffer, Bucket='seronet-trigger-submissions-passed', Key='Tube.csv')
+                    '''
+
+                    if len(x) == 0:
+                        continue
+                    x.drop_duplicates(inplace=True)
+                except Exception as e:
+                    error_msg.append(str(e))
+                    display_error_line(e)
+                output_file = pd.concat([output_file, x])
+                if len(processing_data) > 0 and len(processing_file) > 0:
+                    processing_file = pd.concat([processing_file, processing_data])
+                elif len(processing_data) > 0:
+                     processing_file = processing_data
+
+            if len(output_file) > 0:
+                output_file = correct_var_types(output_file, sql_column_df, curr_table)
+                sql_df = fix_num_cols(sql_df, num_cols, "sql")
+                output_file = fix_num_cols(output_file, num_cols, "file")
+                output_file = fix_char_cols(output_file, char_cols)
+                output_file.drop_duplicates(inplace=True)
+
+                output_file.reset_index(inplace=True, drop=True)
+                output_file = fix_aliquot_ids(output_file, "first", sql_column_df)
+                output_file.replace("N/A", "No Data", inplace=True)
+                output_file.replace("nan", "No Data", inplace=True)
+
+                if "Biospecimens_Collected" in output_file.columns:
+                    output_file.replace('nan', 'No Specimens Collected', inplace=True)
+
+
+                comment_col = [i for i in output_file.columns if "Comments" in i]
+                if len(comment_col) > 0:
+                    output_file[comment_col[0]] = output_file[comment_col[0]].replace("No Data", "")
+                    sql_df[comment_col[0]] = sql_df[comment_col[0]].replace("No Data", "")
+
+                if curr_table not in ["Tube", "Aliquot", "Consumable", "Reagent", "Equipment"]:
+                    col_list = [i for i in sql_df.columns if i not in ["Derived_Result", "Raw_Result", "BMI"]]
+                    sql_df[col_list] = sql_df[col_list].replace("\.0", "", regex=True)
+
+                    col_list = [i for i in output_file.columns if i not in ["Derived_Result", "Raw_Result", "BMI", 'Sample_Dilution']]
+                    output_file[col_list] = output_file[col_list].replace("\.0", "", regex=True)
+
+                number_col = sql_column_df.query("Table_Name == @curr_table and Var_Type in ['FLOAT', 'INTEGER', 'DOUBLE']")["Column_Name"].tolist()
+                for n_col in number_col:
+                    if n_col in output_file.columns:
+                        output_file[n_col].replace("", -1e9, inplace=True)
+                        output_file[n_col].replace("N/A", -1e9, inplace=True)
+                for cell_col in sql_df:
+                    if "Hemocytometer_Count" in cell_col or "Automated_Count" in cell_col:
+                        sql_df[cell_col].replace("No Data", -1e9, inplace=True)
+
+                try:
+                    primary_keys = sql_column_df.query("Table_Name == @curr_table and Primary_Key == 'True' and Autoincrement != True")
+                    if len(primary_keys) > 0:
+                        primary_keys = primary_keys["Column_Name"].tolist()
+                        for i in primary_keys:
+                            output_file[i] = output_file[i].replace("No Data", "")   # primary keys cant be null
+
+                    sql_df.replace("", "No Data", inplace=True)
+                    output_file.replace({"": "No Data"}, inplace=True)
+                    sql_df = sql_df.replace(np.nan, -1e9)
+                    output_file = output_file.replace(np.nan, -1e9)
+
+                    if "Primary_Study_Cohort" in output_file.columns:
+                        output_file.drop("Primary_Study_Cohort", axis=1, inplace=True)
+                    if 'Data_Release_Version' in output_file.columns:
+                        output_file.drop('Data_Release_Version', axis=1, inplace=True)
+
+                    output_file.replace('Lymphocytes', 'PBMC', inplace=True)
+                    output_file.replace('Gist', 'GIST', inplace=True)
+                    if curr_table == "Biospecimen":
+                        output_file = output_file.sort_values(["Biospecimen_ID", "Biospecimen_Collection_Date_Duration_From_Index"])
+                        output_file.drop_duplicates(["Visit_Info_ID", "Biospecimen_ID"], keep="last", inplace=True)
+
+                    if "Sunday_Prior_To_First_Visit" in output_file.columns:
+                        #output_file["Sunday_Prior_To_First_Visit"] = output_file["Sunday_Prior_To_First_Visit"].replace(-1e9, datetime.date(2000,1,1))
+                        #sql_df["Sunday_Prior_To_First_Visit"] = sql_df["Sunday_Prior_To_First_Visit"].replace("No Data", datetime.date(2000,1,1))
+                        sql_df.drop("Sunday_Prior_To_First_Visit", axis=1, inplace=True)
+                    #if 'Submission_Index' not in primary_keys and 'Submission_Index' in sql_df.columns:
+                        #sql_df.drop('Submission_Index', axis=1, inplace=True)
+                    try:
+                        if "Derived_Result" in output_file.columns:
+                            output_file["Derived_Result"].replace("No Data", -1e+09, inplace=True)
+                            output_file["Derived_Result"] = output_file["Derived_Result"].astype(str)
+                        if "Sample_Dilution" in output_file.columns:
+                            output_file["Sample_Dilution"] = output_file["Sample_Dilution"].astype(str)
+                        if "Biospecimens_Collected" in output_file.columns:
+                            output_file["Biospecimens_Collected"].replace("PBMC|serum", "PBMC|Serum", inplace=True)
+                            output_file["Biospecimens_Collected"].replace("serum", "Serum", inplace=True)
+                        if "Biospecimens_Collected" in sql_df.columns:
+                            sql_df["Biospecimens_Collected"].replace("PBMC|serum", "PBMC|Serum", inplace=True)
+                            sql_df["Biospecimens_Collected"].replace("serum", "Serum", inplace=True)
+                        
+                        output_file = output_file.replace('27_403194-400_02', '27_403194_400_02')
+                        z = output_file.merge(sql_df, how="outer", indicator=True)
+                    except Exception:
+                        sql_df["Sample_Dilution"] = sql_df["Sample_Dilution"].to_string()
+                        z = output_file.merge(sql_df[output_file.columns], how="outer", indicator=True)
+                    finally:
+                        new_data = z.query("_merge == 'left_only'")       # new or update data
+                except Exception as e:
+                    #error_msg.append(str(e))
+                    display_error_line(e)
+                    new_data = []
+
+                if len(new_data) > 0:
+                    new_data.drop("_merge", inplace=True, axis=1)
+                    x = sql_column_df.query("Var_Type in ['INTEGER', 'FLOAT']")
+                    x = x.query("Column_Name in @new_data.columns")
+                    update_data = []
+
+                    try:
+                        merge_data = new_data.merge(sql_df[primary_keys], how="left", indicator=True)
+                        merge_data.replace({-1e9: np.nan}, inplace=True)
+                        new_data = merge_data.query("_merge == 'left_only'")
+                        update_data = merge_data.query("_merge == 'both'")
+                    except Exception as e:
+                        error_msg.append(str(e))
+                        display_error_line(e)
+
+                    if len(new_data) > 0:
+                        if "_merge" in new_data.columns:
+                            new_data.drop("_merge", inplace=True, axis=1)
+                        try:
+                            #for testing
+                            '''
+                            if curr_table == "Biospecimen":
+                                csv_buffer = new_data.to_csv(index=False).encode()
+                                s3_client = boto3.client('s3')
+                                s3_client.put_object(Body=csv_buffer, Bucket='seronet-trigger-submissions-passed', Key='Biospecimen_new.csv')
+                            '''
+                            if len(new_data) > 0:
+                                new_data_count = len(new_data)
+                                print(f"## Adding {new_data_count} Rows to table: {curr_table} ##")
+                                success_msg.append(f"## Adding {new_data_count} Rows to table: {curr_table} ##")
+                                new_data.replace("No Data", np.nan, inplace=True)
+                                new_data.replace(datetime.date(2000,1,1), np.nan, inplace=True)
+                                #if "Current Label" in new_data.columns:
+                                    #new_data = new_data.query("`Current Label` not in ['32_441013_102_02', '32_441006_311_01', '32_441131_101_02', " +
+                                    #                          "'32_441040_102_02', '32_441040_102_01', '32_441057_102_02', '32_441057_102_01', '32_441047_102_02', " +
+                                    #                          "'32_441047_102_01', '32_441040_101_02', '32_441040_101_01', '32_441041_101_01', '32_441041_101_02', " +
+                                    #                          "'32_441047_101_01', '32_441047_101_02', '32_441057_101_01','32_441057_101_02']")
+
+                                    #new_data = new_data.query("`Current Label` not in ['32_441083_311_01','32_441153_311_01','32_441112_304_01','32_441095_305_01','32_441108_301_01', " +
+                                    #                          "'32_441139_305_01','32_441013_311_01','32_441146_304_01','32_441165_304_01','32_441131_101_01']")
+                                if "Treatment_History" in curr_table:
+                                    new_data = new_data.drop_duplicates(['Visit_Info_ID', 'Health_Condition_Or_Disease', 'Treatment', 'Dosage', 'Dosage_Units'])
+                                if "Assay_Target_Organism" in new_data.columns:
+                                    new_data = new_data.query("Assay_Target_Organism == Assay_Target_Organism")
+                                if "Biospecimen_ID" in new_data.columns and "Visit_Info_ID" in new_data.columns:
+                                    new_data.sort_values(["Biospecimen_ID", "Visit_Info_ID"], inplace=True)
+                                    new_data.drop_duplicates("Biospecimen_ID", keep="last", inplace=True)
+                                for column in new_data.columns:
+                                    if column not in list(sql_df.columns) and column != "Submission_Index":
+                                        new_data.drop(column, axis=1, inplace=True)
+                                #submission_index was deleted in the sql_df
+                                '''
+                                print(sql_df.columns)
+                                if curr_table == "Participant_Visit_Info":
+                                    csv_buffer = new_data.to_csv(index=False).encode()
+                                    s3_client = boto3.client('s3')
+                                    s3_client.put_object(Body=csv_buffer, Bucket='seronet-trigger-submissions-passed', Key='Participant_Visit_Info.csv')
+                                '''
+                                new_data.to_sql(name=curr_table, con=conn, if_exists="append", index=False)
+                                #conn.connection.commit()
+                        except Exception as e:
+                            display_error_line(e)
+                            error_msg.append(str(e))
+                            print("error loading table")
+                    if len(update_data) > 0:
+                        try:
+                            #for testing
+                            '''
+                            if curr_table == "Biospecimen":
+                                csv_buffer = update_data.to_csv(index=False).encode()
+                                s3_client = boto3.client('s3')
+                                s3_client.put_object(Body=csv_buffer, Bucket='seronet-trigger-submissions-passed', Key='Biospecimen_update.csv')
+                            '''
+                            row_count = len(update_data)
+                            print(f"\n## Updating {row_count} Rows in table: {curr_table} ##\n")
+                            success_msg.append(f"## Updating {row_count} Rows in table: {curr_table} ##")
+                            if "Assay_Target_Organism" in update_data.columns:
+                                update_data = update_data.query("Assay_Target_Organism == Assay_Target_Organism")
+                            update_tables(conn, engine, primary_keys, update_data, curr_table)
+                        except:
+                            display_error_line(e)
+                            error_msg.append(str(e))
+
+                else:
+                    print(f" \n## {curr_table} has been checked, no data to add")
+                    success_msg.append(f"## {curr_table} has been checked, no data to add")
+            else:
+                print(f" \n## {curr_table} was not found in submission, nothing to add")
+                success_msg.append(f" \n## {curr_table} was not found in submission, nothing to add")
+            if len(processing_file) > 0 and "Biospecimen" in done_tables:
+                prim_table = pd.read_sql((f"Select * from {curr_table}"), conn)
+                prim_table.fillna("No Data", inplace=True)  # replace NULL values from sql with "No Data" for merge purposes
+                processing_file.replace("N/A", "No Data", inplace=True)
+                prim_table = prim_table[[i for i in prim_table.columns if "Comments" not in i]]
+                df_obj = processing_file.select_dtypes(['object'])
+                processing_file[df_obj.columns] = df_obj.apply(lambda x: x.str.strip())
+                processing_file = correct_var_types(processing_file, sql_column_df, curr_table)
+                processing_data = processing_data.merge(prim_table, indicator=True, how="left")
+                test_table = processing_data[["Biospecimen_ID", curr_table + "_Index"]]
+
+                sql_table = pd.read_sql((f"SELECT Biospecimen_ID, {curr_table}_Index FROM Biospecimen_{curr_table}"), conn)
+                test_table = test_table.merge(sql_table, how="left", indicator=True)
+                test_table = test_table.query("_merge == 'left_only'").drop("_merge", axis=1)
+                test_table.drop_duplicates(inplace=True)
+                test_table.to_sql(name="Biospecimen_" + curr_table, con=conn, if_exists="append", index=False)
+                #conn.connection.commit()
+    if len(not_done) > 0:
+        add_tables_to_database(engine, conn, sql_table_dict, sql_column_df, master_data_dict, tables_to_check, done_tables)
+
+def fix_num_cols(df, num_cols, data_type):
+    for col_name in df.columns:
+        if col_name in num_cols:
+            if data_type == "file":
+                # df[col_name] = [str(i) for i in df[col_name]]
+                df[col_name] = df[col_name].replace("N/A", np.nan)
+                df[col_name] = df[col_name].replace("Not Reported", np.nan)
+                df[col_name] = df[col_name].replace(-1000000000, np.nan)
+                df[col_name] = df[col_name].replace(-1e+09, np.nan)
+
+            df[col_name] = df[col_name].replace("No Data", np.nan)
+            df[col_name] = df[col_name].replace("nan", np.nan)
+    return df
+
+
+def fix_char_cols(df, char_cols):
+    for col_name in df.columns:
+        if col_name in char_cols:
+            df[col_name] = [str(i).strip() for i in df[col_name]]  # remove trail white space
+            df[col_name] = [str(i).replace("'", "") for i in df[col_name]]  # remove trail white space
+            df[col_name] = [str(i).replace("", "No Data") if len(i) == 0 else i for i in df[col_name]]  # fill blank cells with no data
+    return df
+
+
+def get_col_names(x, y, conn, curr_table, curr_file, sql_column_df):
+    col_list = y["Column_Name"].tolist()
+    if "Normalized_Cohort" in col_list:   # this will be removed once tempaltes updated
+        col_list.remove("Normalized_Cohort")
+    if "Visit_Info_Comments" in col_list:   # this will be removed once tempaltes updated
+        col_list.remove("Visit_Info_Comments")
+    if "Data_Release_Version" in col_list and curr_file not in ["baseline.csv"]:
+        col_list.remove("Data_Release_Version")
+
+    #if curr_table == "Participant":
+    #    if "Sunday_Prior_To_First_Visit" not in x.columns:
+    #        x["Sunday_Prior_To_First_Visit"] =  datetime.date(2000,1,1)
+
+    if curr_table == "Participant_Visit_Info":
+        if "Primary_Study_Cohort" not in x.columns:
+            x["Primary_Study_Cohort"] = "None"
+        if "CBC_Classification" not in x.columns:
+            x.rename(columns={"Cohort": "CBC_Classification"}, inplace=True)
+        x, primary_key = add_visit_info(x, curr_file, [])
     else:
-        template_df = []
-    return template_df, dbname
+        if "Visit_Info_ID" in col_list:
+            visit_data = pd.read_sql(("SELECT Visit_Info_ID, Research_Participant_ID, Visit_Number FROM Participant_Visit_Info;"), conn)
+            list_of_visits = list(range(1,20)) + [str(i) for i in list(range(1,20))]
+            list_of_visits = list_of_visits + [-1, '-1']
+            visit_data["Visit_Number"] = [int(i) if i in list_of_visits else i for i in visit_data["Visit_Number"]]
+            if curr_file == "baseline.csv":
+                x["Visit_Number"] = 1
+            x.replace("Baseline(1)", 1, inplace=True)
+            try:
+                x["Visit_Number"] = [int(i) if i in list_of_visits else i for i in x["Visit_Number"]]
+                x = x.merge(visit_data)
+            except Exception as e:
+                print(e)
+    if "Biospecimen_" in curr_table and "Test_Results" not in curr_table:
+        table_name = curr_table.replace("Biospecimen_", "")
+        table_data = pd.read_sql((f"SELECT * FROM {table_name}"), conn)
+        x = x.merge(table_data)
+
+    if curr_table in ["Biospecimen", "Aliquot"]:
+        tube_data = pd.read_sql(("SELECT * FROM Tube;"), conn)
+        tube_data.fillna("N/A", inplace=True)
+        if curr_table == "Biospecimen":
+            tube_data.columns = [i.replace("Tube", "Collection_Tube") for i in tube_data.columns]
+            x["Collection_Tube_Type_Expiration_Date"] = [i if i == "N/A" else parse(i).date()
+                                                         for i in x["Collection_Tube_Type_Expiration_Date"].tolist()]
+        elif curr_table == "Aliquot":
+            tube_data.columns = [i.replace("Tube", "Aliquot_Tube") for i in tube_data.columns]
+            x["Aliquot_Tube_Type_Expiration_Date"] = [i if i == "N/A" else parse(i).date() for i in x["Aliquot_Tube_Type_Expiration_Date"].tolist()]
+        try:
+            tube_data.replace("N/A", "No Data", inplace=True)
+            x.replace("N/A", "No Data", inplace=True)
+            x.fillna("No Data", inplace=True)
+            
+            if 'Visit_Number' in x.columns:
+                x['Visit_Number'] = [str(i) for i in x['Visit_Number']]
+            for curr_col in x.columns:
+                if curr_col in ['Submission_Index', "Collection_Tube_Type_Expiration_Date", "Aliquot_Tube_Type_Expiration_Date"]:
+                    continue
+                try:
+                    x[curr_col] = x[curr_col].str.strip()
+                except AttributeError:
+                    pass  # not a character col
+            x = x.merge(tube_data, how="left", indicator=True)
+        except Exception as e:
+            print(e)
+
+        if curr_table == "Biospecimen":
+            x.rename(columns={"Collection_Tube_ID": "Biospecimen_Tube_ID"}, inplace=True)
+        else:
+            x.rename(columns={"Collection_Tube_ID": "Aliquot_Tube_ID"}, inplace=True)
+    try:
+        if "Submission_CBC" in col_list and "Submission_CBC" not in x.columns:
+            if "Research_Participant_ID" in x.columns:
+                x['Submission_CBC'] = [str(i[:2]) for i in x["Research_Participant_ID"]]
+            else:
+                x['Submission_CBC'] = [str(i[:2]) for i in x["Biospecimen_ID"]]
+        x = x[[i for i in col_list if i in x.columns]]
+        #x = x[col_list]
+    except Exception as e:
+        display_error_line(e)
+        return []
+    return x
+
+def updated_derived(x):
+    x["Derived_Result"] = [str(i).replace("<", "") for i in x["Derived_Result"]]
+    x["Derived_Result"] = [str(i).replace(">", "") for i in x["Derived_Result"]]
+    x["Derived_Result"] = [str(i).replace("Nonreactive", "-1e9") for i in x["Derived_Result"]]
+    x["Derived_Result"] = [str(i).replace("Reactive", "-1e9") for i in x["Derived_Result"]]
+    return x
+
+def update_secondary_confirm(master_data_dict, sql_column_df):
+    x = master_data_dict["secondary_confirmation_test_result.csv"]["Data_Table"]
+    x = correct_var_types(x, sql_column_df, "Secondary_Confirmatory_Test")
+
+    if "Subaliquot_ID" in x.columns:
+        x["BSI_Parent_ID"] = [i[:7] + " 0001" for i in x["Subaliquot_ID"].tolist()]
+    x.rename(columns={"Comments": "Confirmatory_Clinical_Test_Comments"}, inplace=True)
+    master_data_dict["secondary_confirmation_test_result.csv"]["Data_Table"] = x
+    return master_data_dict
 
 
-def get_template_columns(s3_client,bucket_name, template_dir):
-    template_data = {}
+def get_bio_target(curr_table, conn):
+    global error_msg
+    curr_table.drop_duplicates(inplace=True)
+    curr_cols = curr_table.columns.tolist()
+    curr_cols = [i.replace("Target_biospecimen_is_", "") for i in curr_cols]
+    curr_cols = [i.replace("/", "_") for i in curr_cols]
+    curr_table.columns = curr_cols
 
-    resp = s3_client.list_objects(Bucket=bucket_name, Prefix=template_dir)
-    file_list = resp['Contents']
-    for file in file_list:
-        if "Deprecated" in file['Key'] or "~" in file['Key'] or "$" in file['Key'] or "vaccine_response_data_model.xlsx" in file['Key']:
-            pass
-        elif file['Key'].endswith(".xlsx") or file['Key'].endswith(".xlsm"):
-            file_path = file['Key']
-            obj = s3_client.get_object(Bucket=bucket_name, Key=file_path)
-            curr_data = pd.read_excel(obj['Body'].read(), na_filter=False, engine='openpyxl')
-            curr_data.drop([i for i in curr_data.columns if "Unnamed" in i], axis=1, inplace=True)
-            template_data[os.path.basename(file['Key'])] = {"Data_Table": curr_data}
-
-    col_list = []
-    sheet_name = []
-    for file in template_data:
-        sheet_name = sheet_name + [file]*len(template_data[file]["Data_Table"].columns.tolist())
-        col_list = col_list + template_data[file]["Data_Table"].columns.tolist()
-    return pd.DataFrame({"Sheet_Name": sheet_name, "Column_Name": col_list})
-
-
-def get_summary_file():
-    summary_file = pd.DataFrame(columns=["Submission_Status", "Date_Of_Last_Status", "Folder_Location",
-                                            "CBC_Num", "Date_Timestamp", "Submission_Name", "Validation_Status"])
-    return summary_file
+    bio_type = pd.read_sql("Select * FROM Biospecimen_Type", conn)
+    new_col_names = [i for i in bio_type["Biospecimen_Type"].tolist() if i in curr_table.columns]
+    bio_table = curr_table[new_col_names].stack().to_frame()
+    bio_table.reset_index(inplace=True)
+    bio_table.columns = ["Assay_ID", "Target_Biospecimen_Type", "Is_Present"]
+    try:
+        bio_table["Assay_ID"] = curr_table["Assay_ID"].repeat(len(new_col_names)).tolist()
+        bio_table = bio_table.query("Is_Present == 'Yes'")
+        curr_table = curr_table.merge(bio_table)
+    except Exception as e:
+        error_msg.append(str(e))
+        display_error_line(e)
+    return curr_table
 
 
+def get_bsi_files(s3_client, bucket, sub_folder, master_data_dict):
+    if sub_folder == "Reference Panel Submissions":
+        curr_file = "Serology_Data_Files/biorepository_id_map/Biorepository_ID_Reference_Panel_map.xlsx"
+    elif sub_folder == "Vaccine Response Submissions":
+        curr_file = "Serology_Data_Files/biorepository_id_map/Biorepository_ID_Vaccine_Response_map.xlsx"
+    else:
+        return master_data_dict
+
+    print(" getting bsi parent data ")
+    obj = s3_client.get_object(Bucket=bucket, Key= curr_file)
+    parent_data = pd.read_excel(obj['Body'].read(), sheet_name="BSI_Parent_Aliquots", engine='openpyxl', na_filter=False,)
+    #parent_data = pd_s3.get_df_from_keys(s3_client, bucket, curr_file, suffix="xlsx", format="xlsx", na_filter=False,
+                                         #output_type="pandas", sheet_name="BSI_Parent_Aliquots")
+    print(" gettting bsi child data ")
+    obj_child = s3_client.get_object(Bucket=bucket, Key= curr_file)
+    child_data = pd.read_excel(obj_child['Body'].read(), sheet_name="BSI_Child_Aliquots", engine='openpyxl', na_filter=False,)
+    #child_data = pd_s3.get_df_from_keys(s3_client, bucket, curr_file, suffix="xlsx", format="xlsx", na_filter=False,
+                                        #output_type="pandas", sheet_name="BSI_Child_Aliquots")
+
+    master_data_dict["bsi_parent.csv"] = {"Data_Table": parent_data}
+    master_data_dict["bsi_child.csv"] = {"Data_Table": child_data}
+    return master_data_dict
 
 
-def set_up_function(bucket):
-    warnings.simplefilter("ignore")
+def update_tables(conn, engine, primary_keys, update_table, sql_table):
+    global error_msg
+    key_str = ['`' + str(s) + '`' + " like '%s'" for s in primary_keys]
+    key_str = " and ".join(key_str)
+    try:
+        if "Sunday_Prior_To_First_Visit" in update_table:
+            update_table = update_table[["Research_Participant_ID", "Age", "Sunday_Prior_To_First_Visit"]]
+        else:
+            update_table.drop("_merge", inplace=True, axis=1)
+    except Exception as e:
+        print(e)
 
-    file_sep = os.path.sep
-    eastern = dateutil.tz.gettz("US/Eastern")
-    validation_date = datetime.datetime.now(tz=eastern).strftime("%Y-%m-%d")
-    pd.options.mode.chained_assignment = None  # default='warn'
+    if 'Cancer_Description_Or_ICD10_codes' in update_table.columns:
+        update_table = update_table[['Visit_Info_ID','Cancer_Description_Or_ICD10_codes']]
 
-    s3_client = boto3.client('s3')
-    s3_resource = boto3.resource('s3')
-    cbc_codes = get_cbc_file("Data_Submissions_Need_To_Validate/12 SeroNet Data Submitter Information", s3_client, bucket)
-    print(cbc_codes)
-    return file_sep, s3_client, s3_resource, cbc_codes, validation_date
+    if "Primary_Study_Cohort" in update_table.columns:
+        update_table = update_table.drop("Primary_Study_Cohort", axis=1)
 
-def get_cbc_file(cbc_folder_name, s3_client, bucket):
-    file_path = []
-    resp = s3_client.list_objects(Bucket=bucket, Prefix=cbc_folder_name)
-    file_list = resp['Contents']
-    for f in file_list:
-        if (f['Key'].endswith(".xlsx")):
-            file_path.append(f['Key'])
-    return file_path
+    col_list = update_table.columns.tolist()
+    col_list = [i for i in col_list if i not in primary_keys]
 
+    if "Vaccination_Record" in update_table.columns:
+        col_list.append("Vaccination_Record")
+
+    for index in update_table.index:
+        try:
+            curr_data = update_table.loc[index, col_list].values.tolist()
+            curr_data = [str(i).replace("'", "") for i in curr_data]
+            curr_data = [i.replace('', "NULL") if len(i) == 0 else i for i in curr_data]
+
+            primary_value = update_table.loc[index, primary_keys].values.tolist()
+            primary_value = [str(i).replace(".0", "") for i in primary_value]
+            update_str = ["`" + i + "` = '" + str(j) + "'" for i, j in zip(col_list, curr_data)]
+            update_str = ', '.join(update_str)
+
+            update_str = update_str.replace("'nan'", "NULL")
+            update_str = update_str.replace("'NULL'", "NULL")
+            update_str = update_str.replace("'No Data'", "NULL")
+            update_str = update_str.replace("'2000-01-01'", "NULL")
+            update_str = update_str.replace("`Data_Release_Version` = NULL", "`Data_Release_Version` = '3.0.0'") # outdated, replace later
+            update_str = update_str.replace("`Data_Release_Version` = '2'", "`Data_Release_Version` = '3.0.0'")
+
+            sql_query = (f"UPDATE {sql_table} set {update_str} where {key_str %tuple(primary_value)}")
+            #for make_time_line function
+            sql_query = sql_query.replace("'-10000'", "NULL")
+            sql_query = sql_query.replace("'-10000.0'", "NULL")
+            sql_query = sql_query.replace("like 'nan'", "is NULL")
+            #engine.execute(sql_query)
+            conn.execute(sql_query)
+        except Exception as e:
+            error_msg.append(str(e))
+            display_error_line(e)
+        #finally:
+            #conn.connection.commit()
 
 
 def get_sql_dict_ref(s3_client, bucket):
@@ -771,161 +1562,156 @@ def get_sql_dict_vacc(s3_client, bucket):
 
     return sql_table_dict
 
+def update_norm_cancer(conn, engine):
+    harm_table = pd.read_sql(("SELECT * FROM Normalized_Cancer_Names_v2;"), conn)
+    cancer_dict = pd.read_sql(("SELECT * FROM Normalized_Cancer_Dictionary;"), conn)
+    cancer_names = pd.read_sql(("SELECT Visit_Info_ID, Cancer_Description_Or_ICD10_codes FROM Comorbidities_Names;"), conn)
+    full_table = pd.DataFrame(columns=['Visit_Info_ID', 'Original Cancer Name', 'Harmonized Cancer Name', 'SEER Category', "Found_In_Dict"])
 
-def connect_to_sql_db(host_client, user_name, user_password, file_dbname):
+    cancer_names.fillna('Not Reported', inplace=True)
+    for curr_row in cancer_names.index:
 
-    sql_column_df = pd.DataFrame(columns=["Table_Name", "Column_Name", "Var_Type", "Primary_Key", "Autoincrement",
-                                          "Foreign_Key_Table", "Foreign_Key_Column"])
-    creds = {'usr': user_name, 'pwd': user_password, 'hst': host_client, "prt": 3306, 'dbn': file_dbname}
-    connstr = "mysql+mysqlconnector://{usr}:{pwd}@{hst}:{prt}/{dbn}"
-    engine = sd.create_engine(connstr.format(**creds))
-    engine = engine.execution_options(autocommit=False)
-    conn = engine.connect()
-    metadata = sd.MetaData()
-    metadata.reflect(engine)
-
-    for t in metadata.tables:
-        try:
-            curr_table = metadata.tables[t]
-            curr_table = curr_table.columns.values()
-            for curr_row in range(len(curr_table)):
-                curr_dict = {"Table_Name": t, "Column_Name": str(curr_table[curr_row].name),
-                             "Var_Type": str(curr_table[curr_row].type),
-                             "Primary_Key": str(curr_table[curr_row].primary_key),
-                             "Autoincrement": False,
-                             "Foreign_Key_Count": 0,
-                             "Foreign_Key_Table": 'None',
-                             "Foreign_Key_Column": 'None'}
-                curr_dict["Foreign_Key_Count"] = len(curr_table[curr_row].foreign_keys)
-                if curr_table[curr_row].autoincrement is True:
-                    curr_dict["Autoincrement"] = True
-                if len(curr_table[curr_row].foreign_keys) == 1:
-                    key_relation = list(curr_table[curr_row].foreign_keys)[0].target_fullname
-                    key_relation = key_relation.split(".")
-                    curr_dict["Foreign_Key_Table"] = key_relation[0]
-                    curr_dict["Foreign_Key_Column"] = key_relation[1]
+        z = cancer_names["Cancer_Description_Or_ICD10_codes"][curr_row].split("|")
+        z = [i.strip() for i in z]
+        z = pd.DataFrame(z, columns= ["Cancer"])
+        z["Visit_Info_ID"] = cancer_names["Visit_Info_ID"][curr_row]
+        merge_1 = z.merge(cancer_dict, how="left", indicator="Found_In_Dict")
+        merge_1 = merge_1.rename(columns={'Cancer': 'Original Cancer Name'})
+        full_table = pd.concat([full_table, merge_1])
 
 
-                sql_column_df = pd.concat([sql_column_df, pd.DataFrame.from_records([curr_dict])])
-        except Exception as e:
-            display_error_line(e)
-    print("## Sucessfully Connected to " + file_dbname + " ##")
-    sql_column_df.reset_index(inplace=True, drop=True)
-    return sql_column_df, engine, conn
+    full_table.drop_duplicates(inplace=True)
+    full_table.to_sql("Normalized_Cancer_Names_v2",con=engine, if_exists="append", index=False)
 
-def to_s3_csv(file_key, df, index_bool, bucket, s3_client):
-    csv_buffer = df.to_csv(index=index_bool).encode()
-    s3_client.put_object(Body=csv_buffer, Bucket=bucket, Key=file_key)
+    #full_table = full_table.query("`Original Cancer Name` != ''")         #remove records that are not found
+    z = full_table.merge(harm_table, on=["Visit_Info_ID", 'Original Cancer Name'], how="left")
+    merge_data = z.query("`Harmonized Cancer Name_x` != `Harmonized Cancer Name_y`")
+    new_data = merge_data.query("`Harmonized Cancer Name_y` != `Harmonized Cancer Name_y`")
 
-def write_to_slack(message_slack, slack_chanel):
-    http = urllib3.PoolManager()
-    data={"text": message_slack}
-    r=http.request("POST", slack_chanel, body=json.dumps(data), headers={"Content-Type":"application/json"})
+    new_data = new_data[['Visit_Info_ID', 'Original Cancer Name', 'Harmonized Cancer Name_x', 'SEER Category_x']]
+    new_data.columns = [i.replace("_x","") for i in new_data.columns]
+    new_data.to_sql("Normalized_Cancer_Names_v2",con=engine, if_exists="append", index=False)
 
-def move_submission(curr_bucket, new_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type):
-    # curr_bucket = seronet-demo-cbc-destination
-    # file_path = "Accrual_Need_To_Validate/cbc02/2023-05-09-10-27-51/submission_007_accrual_submission_5_9_23.zip/"
-    print(curr_bucket)
-    #study_type = "Refrence_Pannel"
-    if study_type == "Vaccine_Response":
-        study_sub_folder = "Vaccine Response Submissions/"
-    else:
-        study_sub_folder = "Reference Panel Submissions/"
-    all_files = s3_client.list_objects_v2(Bucket=curr_bucket, Prefix=os.path.dirname(os.path.split(file_path)[0]))["Contents"]
-    all_files = [i["Key"] for i in all_files]
-    sub_files = [i for i in all_files if "UnZipped_Files/submission.csv" not in i]
-    submission_csv_key = [i for i in all_files if "UnZipped_Files/submission.csv" in i]
-    sub_files.append(submission_csv_key[0])
-
-    for curr_key in sub_files:
-        new_key = curr_key.replace("Data_Submissions_Need_To_Validate", site_name)
-        new_key = new_key.replace(curr_cbc+'/', '')
-        new_key = study_sub_folder + new_key
-        source = {'Bucket': curr_bucket, 'Key': curr_key}               # files to copy
-        try:
-            s3_resource.meta.client.copy(source, new_bucket, new_key)
-            print(f"atempting to delete {curr_bucket} / {curr_key}")
-            s3_client.delete_object(Bucket=curr_bucket, Key=curr_key)
-        except Exception as error:
-            print('Error Message: {}'.format(error))
+    print("x")
+    return full_table
 
 
-def send_respond_email(s3_client, bucket, ssm, file_name, error_list, email_msg, s3_zip_file_key):
-    http = urllib3.PoolManager()
-    USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
-    PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
-    HOST = "email-smtp.us-east-1.amazonaws.com"
-    PORT = 587
+#get box data function
+def get_assay_data(s3_client, data_type, bucket_name):
+    #file_sep = os.path.sep
+    #box_dir = "C:" + file_sep + "Users" + file_sep + os.getlogin() + file_sep + "Box"
+    #assay_dir = box_dir + file_sep + "CBC_Folders"
+    #assay_dir = "C:\\Data_Validation_CBC\Assay_Data_Folder"
+    assay_dir = "CBC_Folders/"
+    file_list = s3_client.list_objects(Bucket=bucket_name, Prefix=assay_dir)
+    #print(file_list["Contents"][1])
+    assay_paths = []
+    path_dir = pd.DataFrame(columns=["Dir_Path", "File_Name", "Date_Created", "Date_Modified"])
+    for file in file_list["Contents"]:
+        if (file['Key'].endswith(".xlsx")) and ("20210402" not in file['Key']):
+            file_path = file['Key']
+            assay_paths.append(file_path)
+            created = file['LastModified']
+            modified =  file['LastModified']
+            path_dir.loc[len(path_dir.index)] = [os.path.dirname(file['Key']), os.path.basename(file['Key']), created, modified]
 
+    if data_type == "CBC_Data":
+        all_assay_data = pd.DataFrame()
+        all_target_data = pd.DataFrame()
+        all_qc_data = pd.DataFrame()
+        converion_file = pd.DataFrame()
+
+        uni_path = list(set(path_dir["Dir_Path"]))
+        for curr_path in uni_path:
+            curr_folder = path_dir.query("Dir_Path == @curr_path")
+            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: 'assay' in x and "assay_qc" not in x
+                                                                    and "assay_target" not in x)]
+            all_assay_data = populate_df(all_assay_data, assay_file, bucket_name, s3_client)
+
+            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: "assay_qc" in x)]
+            all_qc_data = populate_df(all_qc_data, assay_file, bucket_name, s3_client)
+
+            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: "assay_target_antigen" in x or
+                                                                    "assay_target" in x)]
+            all_target_data = populate_df(all_target_data, assay_file, bucket_name, s3_client)
+
+            assay_file = curr_folder[curr_folder["File_Name"].apply(lambda x: "Assay_Target_Organism_Conversion.xlsx" in x)]
+            converion_file = populate_df(converion_file, assay_file, bucket_name, s3_client)
+
+        if len(all_assay_data) > 0:
+            all_assay_data = box_clean_up_tables(all_assay_data, '[0-9]{2}[_]{1}[0-9]{3}$')
+        if len(all_target_data) > 0:
+            all_target_data = box_clean_up_tables(all_target_data, '[0-9]{2}[_]{1}[0-9]{3}$')
+        if len(all_qc_data) > 0:
+            all_qc_data = box_clean_up_tables(all_qc_data, '[0-9]{2}[_]{1}[0-9]{3}$')
+
+        return all_assay_data, all_target_data, all_qc_data, converion_file
+    elif data_type == "Validation":
+        #print("x")
+        assay_file = assay_dir + "Seronet_Reference_Panels/"+ "validation_panel_assays.xlsx"
+        #curr_data = pd.read_excel(assay_file, na_filter=False, engine='openpyxl')
+        obj = s3_client.get_object(Bucket=bucket_name, Key=assay_file)
+        curr_data = pd.read_excel(obj['Body'].read(), na_filter=False, engine='openpyxl')
+        return curr_data
+
+
+def populate_df(curr_assay, assay_file, bucket_name, s3_client):
+    if len(assay_file):
+        curr_data = assay_file[assay_file["Date_Modified"] == max(assay_file["Date_Modified"])]
+        file_path = os.path.join(curr_data["Dir_Path"].tolist()[0], curr_data["File_Name"].tolist()[0])
+        #curr_data = pd.read_excel(file_path, na_filter=False, engine='openpyxl')
+        obj = s3_client.get_object(Bucket=bucket_name, Key=file_path)
+        curr_data = pd.read_excel(obj['Body'].read(), na_filter=False, engine='openpyxl')
+        curr_assay = pd.concat([curr_assay, curr_data])
+    return curr_assay
+
+
+def box_clean_up_tables(curr_table, ptrn_str):
+    curr_table = curr_table[curr_table["Assay_ID"].apply(lambda x: re.compile(ptrn_str).match(str(x)) is not None)]
+    curr_table = curr_table.dropna(axis=0, how="all", subset=None)
+    if len(curr_table) > 0:
+        missing_logic = curr_table.eq(curr_table.iloc[:, 0], axis=0).all(axis=1)
+        curr_table = curr_table[[i is not True for i in missing_logic]]
+        curr_table = curr_table.loc[:, ~curr_table .columns.str.startswith('Unnamed')]
+        curr_table = curr_table.replace('–', '-')
+        curr_table.columns = [i.replace("Assay_Target_Antigen", "Assay_Target") for i in curr_table.columns]
+        curr_table.columns = [i.replace("lavage", "Lavage") for i in curr_table.columns]
+    return curr_table
+
+
+def get_study_design(s3_client, bucket_name):
+    global success_msg
+    # opens box and gets the study design.csv file directly from box
+    #file_sep = os.path.sep
+    #box_dir = "C:" + file_sep + "Users" + file_sep + os.getlogin() + file_sep + "Box"
+    #design_dir = box_dir + file_sep + "CBC_Folders"
+    design_dir = "CBC_Folders/"
+    file_list = s3_client.list_objects(Bucket=bucket_name, Prefix=design_dir)
+    study_paths = []
+
+    study_data = pd.DataFrame(columns=["Cohort_Name", "Index_Date", "Notes", "CBC_Name"])
+    for file in file_list["Contents"]:
+        if (file['Key'].endswith(".csv")) and ("Vaccine_Respone_Study_Design" in file['Key']):
+            file_path = file['Key']
+            study_paths.append(file_path)
+
+    for curr_path in study_paths:
+        obj = s3_client.get_object(Bucket=bucket_name, Key= curr_path)
+        curr_data = pd.read_csv(obj['Body'])
+        r = os.path.dirname(curr_path)
+        curr_data["CBC_Name"]= r.split("/")[1]
+        study_data = pd.concat([study_data, curr_data])
+    if len(study_data) > 0:
+        print("## The study design data has been uploaded")
+        success_msg.append("## The study design data has been updated")
+
+    return study_data
+
+def sns_publisher(message,TopicArn_make_time_line):
     try:
-        RECIPIENT_RAW = ssm.get_parameter(Name="Shipping_Manifest_Recipents", WithDecryption=True).get("Parameter").get("Value")
-        RECIPIENT = RECIPIENT_RAW.replace(" ", "")
-        RECIPIENT_LIST = RECIPIENT.split(",")
-        SUBJECT = f'Data Submission Feedback: {file_name}'
-        SENDERNAME = 'SeroNet Data Team (Data Curation)'
-        SENDER = ssm.get_parameter(Name="sender-email", WithDecryption=True).get("Parameter").get("Value")
-
-        for recipient in RECIPIENT_LIST:
-            print(recipient)
-            msg_text = ""
-            msg_text += "Your data submission has been analyzed by the validation software. \n"
-            msg_text += email_msg
-
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = SUBJECT
-            msg['From'] = email.utils.formataddr((SENDERNAME, SENDER))
-            if len(error_list) > 0:
-                if s3_zip_file_key != "":
-                    s3_object = s3_client.get_object(Bucket=bucket, Key= s3_zip_file_key)
-                    body = s3_object['Body'].read()
-                    filename = os.path.basename(s3_zip_file_key)
-                    attachment = MIMEApplication(body, filename)
-                    attachment.add_header("Content-Disposition", 'attachment', filename = filename)
-                    msg.attach(attachment)
-                    #msg.attach(obj)
-
-                #msg_text += f"\n\nAn Error file was created and attached to this email"
-                msg_text += f"\nLet me know if you have any questions\n"
-            msg['To'] = recipient
-            part1 = MIMEText(msg_text, "plain")
-            msg.attach(part1)
-            print(msg_text)
-            send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg)
-            print("email has been sent")
-
-    except Exception as e:
-        display_error_line(e)
-        #data={"text": display_error_line(e)}
-        #r=http.request("POST", slack_fail, body=json.dumps(data), headers={"Content-Type":"application/json"})
-
-def send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg):
-    server = smtplib.SMTP(HOST, PORT)
-    server.ehlo()
-    server.starttls()
-    #stmplib docs recommend calling ehlo() before & after starttls()
-    server.ehlo()
-    server.login(USERNAME_SMTP, PASSWORD_SMTP)
-
-    server.sendmail(SENDER, recipient, msg.as_string())
-    #print(msg)
-    server.close()
-
-def zip_files_from_s3(s3_client, response, bucket_name, prefix, temp_dir, zip_file_name):
-    # Download data validation result to the temporary directory
-    download_files = []
-    zip_file_path = os.path.join(temp_dir, zip_file_name)
-    os.makedirs(temp_dir, exist_ok=True)
-    if 'Contents' in response:
-        for obj in response['Contents']:
-            if obj['Key'].endswith(".csv"):
-                file_key = obj['Key']
-                file_name = os.path.basename(file_key)
-                download_path = os.path.join(temp_dir, file_name)
-                s3_client.download_file(bucket_name, file_key, download_path)
-                download_files.append(download_path)
-    with zipfile.ZipFile(zip_file_path, 'w') as zipf:
-        for file in download_files:
-            zipf.write(file, os.path.basename(file))
-    s3_file_key = os.path.join(prefix, os.path.basename(zip_file_path))
-    response = s3_client.upload_file(zip_file_path, bucket_name, s3_file_key)
-    return s3_file_key
+        sns = boto3.client('sns')
+        response = sns.publish(TopicArn=TopicArn_make_time_line, Message=str(message))
+        # return out the response
+        return response
+    except Exception as err:
+        display_error_line(err)
