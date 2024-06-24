@@ -80,16 +80,16 @@ def lambda_handler(event, context):
             for m in error_message['message']:
                 message_slack_fail = message_slack_fail + m + "\n"
         write_to_slack(message_slack_fail, slack_fail)
-        move_submission(bucket, fail_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
         send_respond_email(s3_client, bucket, ssm, sub_name, list(error_message['message']), message_slack_fail, s3_file_key)
+        move_submission(bucket, fail_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
     else:
         message_slack_success = "Your data submission " + sub_name + " has been analyzed by the validation software.\n" + "1) Analysis of the Zip File: Passed\n" + "2) Data Validation: Passed\n"
         if len(warning_message) > 0:
             for i in range(0, len(warning_message)):
                 message_slack_success = message_slack_success + str(i + 3) + ") " + "Warning: " + warning_message[i] + "\n"
         write_to_slack(message_slack_success, slack_pass)
-        move_submission(bucket, passed_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
         send_respond_email(s3_client, bucket, ssm, sub_name, warning_message, message_slack_success, s3_file_key)
+        move_submission(bucket, passed_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc, study_type)
 
 
 
